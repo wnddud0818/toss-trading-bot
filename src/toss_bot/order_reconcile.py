@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from .config import ExecutionSettings
 from .toss_client import TossClient
-from .utils import KST, now_kst
+from .utils import KST, extract_items, now_kst
 
 
 OPEN_ORDER_STATUSES = {"PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE"}
@@ -33,7 +33,7 @@ class OrderReconciler:
     def reconcile(self, *, cancel_stale: bool | None = None) -> ReconcileReport:
         should_cancel = self.settings.cancel_stale_orders if cancel_stale is None else cancel_stale
         payload = self.toss_client.get_open_orders()
-        orders = payload.get("orders", payload if isinstance(payload, list) else [])
+        orders = extract_items(payload, "orders")
         cutoff = now_kst() - timedelta(minutes=self.settings.stale_order_minutes)
         canceled = 0
         kept = 0

@@ -47,6 +47,18 @@ def test_429_retries_once_with_rate_limit_headers():
     assert calls.count("/api/v1/accounts") == 2
 
 
+def test_request_returns_bare_list_payload():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(200, json={"access_token": "token", "token_type": "Bearer", "expires_in": 3600})
+        return httpx.Response(200, json=[{"accountSeq": 1}])
+
+    settings = Settings(toss_client_id="id", toss_client_secret="secret")
+    client = TossClient(settings, httpx.Client(transport=httpx.MockTransport(handler), base_url=settings.toss.base_url))
+
+    assert client.get_accounts() == [{"accountSeq": 1}]
+
+
 def test_price_limit_wrapper_uses_toss_endpoint():
     seen = []
 

@@ -102,7 +102,7 @@ class TossClient:
         if response.status_code >= 400:
             self._raise_for_response(response)
         payload = response.json()
-        return payload.get("result", payload)
+        return payload.get("result", payload) if isinstance(payload, dict) else payload
 
     def get_accounts(self) -> Any:
         return self.request("GET", "/api/v1/accounts")
@@ -205,8 +205,12 @@ class TossClient:
         return self.request("POST", f"/api/v1/orders/{order_id}/modify", json=body, account_required=True)
 
     def _sleep_for_rate_limit(self, response: httpx.Response) -> None:
-        seconds = response.headers.get("Retry-After") or response.headers.get("X-RateLimit-Reset") or "1"
-        time.sleep(max(float(seconds), 0.1))
+        raw = response.headers.get("Retry-After") or response.headers.get("X-RateLimit-Reset") or "1"
+        try:
+            seconds = float(raw)
+        except ValueError:
+            seconds = 1.0
+        time.sleep(min(max(seconds, 0.1), 30.0))
 
     def _raise_for_response(self, response: httpx.Response) -> None:
         try:

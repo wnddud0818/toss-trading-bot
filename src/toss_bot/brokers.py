@@ -6,7 +6,7 @@ from .config import Settings
 from .db import BotRepository
 from .models import OrderRequest, OrderResult, OrderSide, Position, RunMode
 from .toss_client import TossApiError, TossClient
-from .utils import dec, make_client_order_id, money, now_kst, qty
+from .utils import dec, extract_items, make_client_order_id, money, now_kst, qty
 
 
 OPEN_ORDER_STATUSES = {"PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE"}
@@ -132,6 +132,7 @@ class LiveBroker:
         self.settings = settings
         self.toss_client = toss_client
         self.repository = repository
+        self._last_prices: dict[str, Decimal] = {}
         if settings.mode != RunMode.LIVE:
             raise RuntimeError("settings.mode must be live for LiveBroker")
         if not settings.enable_live_trading:
@@ -147,7 +148,8 @@ class LiveBroker:
         if order.side == OrderSide.BUY:
             buying_power = self.toss_client.get_buying_power("KRW")
             cash = dec(buying_power.get("cashBuyingPower", 0))
-            if estimated_amount > cash:
+            required = estimated_amount * (Decimal("1") + dec(self.settings.risk.commission_rate))
+            if required > cash:
                 raise RuntimeError("live buying power is insufficient")
         else:
             sellable = self.toss_client.get_sellable_quantity(order.symbol)
@@ -180,7 +182,7 @@ class LiveBroker:
 
     def positions(self) -> list[Position]:
         holdings = self.toss_client.get_holdings()
-        items = holdings.get("items", holdings if isinstance(holdings, list) else [])
+        items = extract_items(holdings, "items")
         today = now_kst().date()
         positions: list[Position] = []
         active_symbols: set[str] = set()
@@ -193,6 +195,7 @@ class LiveBroker:
             entry_price = dec(item.get("averagePurchasePrice", item.get("lastPrice", 0)))
             last_price = dec(item.get("lastPrice", entry_price))
             active_symbols.add(item["symbol"])
+            self._last_prices[item["symbol"]] = last_price
             entry_date = today
             high_watermark = max(entry_price, last_price)
             if self.repository is not None:
@@ -218,7 +221,9 @@ class LiveBroker:
         latest_prices = latest_prices or {}
         equity = self.cash()
         for position in self.positions():
-            equity += position.quantity * latest_prices.get(position.symbol, position.high_watermark)
+            # high_watermark로 마킹하면 자산이 과대평가되어 손실 한도 감지가 늦어진다.
+            mark = latest_prices.get(position.symbol) or self._last_prices.get(position.symbol) or position.entry_price
+            equity += position.quantity * mark
         return money(equity)
 
     def update_high_watermark(self, symbol: str, high_watermark: Decimal) -> None:
@@ -234,7 +239,7 @@ class LiveBroker:
 
     def _assert_no_conflicting_open_order(self, order: OrderRequest) -> None:
         open_orders = self.toss_client.get_open_orders(order.symbol)
-        orders = open_orders.get("orders", open_orders if isinstance(open_orders, list) else [])
+        orders = extract_items(open_orders, "orders")
         for open_order in orders:
             if open_order.get("status") not in OPEN_ORDER_STATUSES:
                 continue

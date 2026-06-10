@@ -10,7 +10,7 @@ from .db import BotRepository
 from .execution import ExecutionPlanner
 from .market_calendar import KrMarketSession, parse_kr_market_session
 from .market_filter import MarketFilter
-from .models import Candle, OrderSide, OrderType, RunMode, Signal
+from .models import Candle, OrderSide, RunMode, Signal
 from .notifications import DiscordNotifier
 from .order_reconcile import OrderReconciler, ReconcileReport
 from .reports import ReportWriter
@@ -18,7 +18,7 @@ from .risk import RiskManager, RiskState
 from .strategy import HybridMomentumStrategy
 from .toss_client import TossClient
 from .universe import UniverseBuilder
-from .utils import dec, now_kst, parse_toss_candle
+from .utils import dec, extract_items, now_kst, parse_toss_candle
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ class TradingBot:
         )
         self.risk.update_equity(equity, today)
         self.repository.save_risk_state(self.risk.state)
+        self._last_halt_reason = self.risk.state.halted_reason
 
     def preflight(self) -> None:
         self.toss_client.get_accounts()
@@ -94,10 +95,15 @@ class TradingBot:
         positions = {position.symbol: position for position in self.broker.positions()}
         latest_prices = self._latest_prices(list(positions))
         equity = self.broker.portfolio_value(latest_prices)
+        # CLI의 halt/resume이 DB에만 반영되므로 루프마다 저장된 상태를 권위로 삼는다.
+        stored_state = self.repository.load_risk_state()
+        if stored_state is not None:
+            self.risk.state = stored_state
         self.risk.positions = positions
         self.risk.update_equity(equity, today)
         self.repository.save_risk_state(self.risk.state)
         self.repository.record_equity(now_kst(), equity)
+        self._notify_halt_change()
 
         self._process_exits(positions, today, market_ok if market_signal is not None else True)
         if market_signal is None:
@@ -112,21 +118,16 @@ class TradingBot:
         self._process_entries()
 
     def close_policy(self) -> None:
-        for position in self.broker.positions():
-            candles = self._candles(position.symbol, "1m", 30)
-            if not candles:
-                continue
-            latest = candles[-1]
-            self._update_high_watermark(position.symbol, latest.high)
-            signal = Signal(
-                symbol=position.symbol,
-                side=OrderSide.SELL,
-                order_type=OrderType.LIMIT,
-                quantity=position.quantity,
-                limit_price=latest.close,
-                reason="closing policy",
-            )
-            self._place_signal(signal, urgent=True)
+        """종가 구간에서 청산 조건을 한 번 더 평가한다. 전 종목 일괄 청산이 아니라
+        장중 루프 종료(15:20) 이후 손절/보유일 초과 등에 걸린 포지션만 정리한다."""
+        session = self._market_session()
+        if not session.business_day:
+            logger.info("Close policy skipped: not a KR business day")
+            return
+        today = now_kst().date()
+        market_signal = self.market_filter.risk_on(today)
+        positions = {position.symbol: position for position in self.broker.positions()}
+        self._process_exits(positions, today, market_signal is not False)
 
     def reconcile_open_orders(self, *, cancel_stale: bool | None = None) -> ReconcileReport:
         report = self.order_reconciler.reconcile(cancel_stale=cancel_stale)
@@ -141,13 +142,17 @@ class TradingBot:
 
     def _process_exits(self, positions: dict[str, object], today: date, market_ok: bool) -> None:
         for position in list(positions.values()):
-            candles = self._candles(position.symbol, "1m", 80)
-            if candles:
-                self._update_high_watermark(position.symbol, max(candle.high for candle in candles))
-            signal = self.strategy.exit_signal(position, candles, today, market_filter_ok=market_ok)
-            if signal is None:
-                continue
-            self._place_signal(signal, urgent=True)
+            try:
+                candles = self._candles(position.symbol, "1m", 80)
+                if candles:
+                    self._update_high_watermark(position.symbol, max(candle.high for candle in candles))
+                signal = self.strategy.exit_signal(position, candles, today, market_filter_ok=market_ok)
+                if signal is None:
+                    continue
+                self._place_signal(signal, urgent=True)
+            except Exception:
+                # 한 종목 처리 실패가 나머지 포지션의 손절까지 막으면 안 된다.
+                logger.exception("Exit processing failed for %s", position.symbol)
 
     def _process_entries(self) -> None:
         if now_kst().strftime("%H:%M") >= self.settings.strategy.new_entries_cutoff:
@@ -155,35 +160,55 @@ class TradingBot:
             return
         cash = self.broker.cash()
         for candidate in self._ranked_candidates()[: self.settings.strategy.max_positions]:
-            can_enter, reason = self.risk.can_enter(candidate.symbol, cash, self.settings.strategy.max_positions)
-            if not can_enter:
-                logger.info("Skip entry %s: %s", candidate.symbol, reason)
-                continue
-            budget = self.risk.position_budget(cash, candidate.volatility, dec(self.settings.strategy.stop_loss_pct))
-            if budget <= 0:
-                return
-            daily = self._candles(candidate.symbol, "1d", 130)
-            intraday = self._candles(candidate.symbol, "1m", 80)
-            signal = self.strategy.entry_signal(candidate, daily, intraday, budget)
-            if signal is None:
-                continue
-            result = self._place_signal(signal, urgent=False)
-            if result is None:
-                continue
-            cash = self.broker.cash()
-            self.notifier.send(f"[toss-bot] entry {signal.symbol}: {result.status} {signal.reason}")
+            try:
+                can_enter, reason = self.risk.can_enter(candidate.symbol, cash, self.settings.strategy.max_positions)
+                if not can_enter:
+                    logger.info("Skip entry %s: %s", candidate.symbol, reason)
+                    continue
+                budget = self.risk.position_budget(cash, candidate.volatility, dec(self.settings.strategy.stop_loss_pct))
+                if budget <= 0:
+                    # 변동성 스케일링 때문에 후보마다 예산이 달라서 다음 후보는 통과할 수 있다.
+                    logger.info("Skip entry %s: budget below minimum order amount", candidate.symbol)
+                    continue
+                daily = self._candles(candidate.symbol, "1d", 130)
+                intraday = self._candles(candidate.symbol, "1m", 80)
+                signal = self.strategy.entry_signal(candidate, daily, intraday, budget)
+                if signal is None:
+                    continue
+                result = self._place_signal(signal, urgent=False)
+                if result is None:
+                    continue
+                cash = self.broker.cash()
+                self.notifier.send(f"[toss-bot] entry {signal.symbol}: {result.status} {signal.reason}")
+            except Exception:
+                logger.exception("Entry processing failed for %s", candidate.symbol)
 
     def _place_signal(self, signal: Signal, *, urgent: bool):
         plan = self.execution.plan(signal, urgent=urgent or signal.side == OrderSide.SELL)
         if not plan.accepted or plan.order is None:
             logger.info("Execution rejected %s %s: %s", signal.side, signal.symbol, plan.reason)
-            if signal.side == OrderSide.BUY:
-                return None
-            self.notifier.send(f"[toss-bot] exit rejected {signal.symbol}: {plan.reason}")
+            if signal.side == OrderSide.SELL:
+                self.notifier.send(f"[toss-bot] exit rejected {signal.symbol}: {plan.reason}")
             return None
-        result = self.broker.place_order(plan.order, reason=signal.reason)
+        try:
+            result = self.broker.place_order(plan.order, reason=signal.reason)
+        except Exception as exc:
+            logger.exception("Order placement failed %s %s", signal.side, signal.symbol)
+            if signal.side == OrderSide.SELL:
+                self.notifier.send(f"[toss-bot] exit order failed {signal.symbol}: {exc}")
+            return None
         self.repository.record_order(now_kst(), self.settings.mode.value, plan.order, result, reason=signal.reason)
         return result
+
+    def _notify_halt_change(self) -> None:
+        reason = self.risk.state.halted_reason
+        if reason == self._last_halt_reason:
+            return
+        if reason:
+            self.notifier.send(f"[toss-bot] trading halted: {reason}")
+        else:
+            self.notifier.send("[toss-bot] trading halt cleared")
+        self._last_halt_reason = reason
 
     def _update_high_watermark(self, symbol: str, high_watermark: Decimal) -> None:
         updater = getattr(self.broker, "update_high_watermark", None)
@@ -197,15 +222,13 @@ class TradingBot:
 
     def _candles(self, symbol: str, interval: str, count: int) -> list[Candle]:
         result = self.toss_client.get_candles(symbol, interval, count)
-        candles = result.get("candles", result if isinstance(result, list) else [])
-        return [parse_toss_candle(item) for item in candles]
+        return [parse_toss_candle(item) for item in extract_items(result, "candles")]
 
     def _latest_prices(self, symbols: list[str]) -> dict[str, Decimal]:
         if not symbols:
             return {}
         prices = self.toss_client.get_prices(symbols)
-        items = prices.get("prices", prices if isinstance(prices, list) else [])
-        return {item["symbol"]: dec(item["lastPrice"]) for item in items}
+        return {item["symbol"]: dec(item["lastPrice"]) for item in extract_items(prices, "prices")}
 
     def _market_session(self) -> KrMarketSession:
         today = now_kst().date()

@@ -47,7 +47,12 @@ toss-bot run --mode paper
 toss-bot run --mode paper --once
 toss-bot reconcile --cancel-stale
 toss-bot report --date 2026-06-10
+toss-bot status
+toss-bot halt --reason "수동 점검"
+toss-bot resume --reset-peak
 ```
+
+`status`는 리스크 상태(자산, 일/주 시작 자산, 고점, 중지 사유)와 모의 포지션, 최근 주문을 보여줍니다. `halt`/`resume`은 수동 킬스위치로, 실행 중인 봇도 다음 루프에서 DB에 저장된 중지 상태를 반영합니다. 최대 낙폭 한도로 중지된 경우에는 검토 후 `resume --reset-peak`으로 고점을 현재 자산으로 재설정해야 재중지되지 않습니다.
 
 실거래는 아래 조건이 모두 맞아야 실행됩니다.
 
@@ -99,6 +104,11 @@ ENABLE_LIVE_TRADING=true
 
 - `/api/v1/market-calendar/KR` 기준으로 정규장 밖 주문 루프 차단
 - 종가 단일가 시작 이후 신규 진입 차단
+- 종가 구간(15:25)에는 전 종목 일괄 청산이 아니라 손절·트레일링·최대 보유일 등 청산 조건을 다시 평가해 해당 포지션만 정리
+- 스케줄 작업은 평일에만 실행하고, 휴장일에는 장 캘린더 기준으로 건너뜀
+- 주문 1건 실패가 나머지 포지션의 청산 처리를 막지 않도록 종목 단위로 격리
+- 일/주 손실 한도, 최대 낙폭 도달 시 매매 중지 및 Discord 알림
+- `toss-bot halt` / `toss-bot resume` 수동 킬스위치
 - `toss-bot reconcile --cancel-stale`로 오래된 미체결 국내주식 주문 취소
 - 스케줄러가 장중 5분마다 미체결 주문을 점검
 
@@ -159,7 +169,7 @@ ENABLE_LIVE_TRADING=true
 1. `toss-bot doctor`로 인증과 계좌 상태를 확인합니다.
 2. `toss-bot backtest`로 전략이 비용 포함 후에도 의미 있는지 확인합니다.
 3. `mode: paper`에서 최소 20거래일 이상 `toss-bot run --mode paper`를 돌립니다.
-4. `reports/YYYY-MM-DD.md`에서 주문 감사와 체결 기록을 확인합니다.
+4. `reports/YYYY-MM-DD.md`에서 주문 감사, 체결 기록, 실현손익 요약을 확인합니다.
 5. 실거래 전 `max_live_order_amount_krw`를 아주 작게 낮춰 소액 검증합니다.
 6. 실거래는 `.env`, 설정 파일, CLI 인자가 모두 live 조건을 만족할 때만 실행합니다.
 

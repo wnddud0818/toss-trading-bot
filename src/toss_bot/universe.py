@@ -9,7 +9,7 @@ from .config import UniverseSettings
 from .db import BotRepository
 from .models import UniverseCandidate
 from .toss_client import TossClient
-from .utils import dec, quiet_external_data_source
+from .utils import dec, extract_items, quiet_external_data_source
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +131,7 @@ class UniverseBuilder:
         allowed = {candidate.symbol: candidate for candidate in candidates}
         verified_symbols: set[str] = set()
         for batch in _chunks(list(allowed), 200):
-            for stock_info in self.toss_client.get_stocks(batch):
+            for stock_info in extract_items(self.toss_client.get_stocks(batch), "stocks", "items"):
                 symbol = stock_info.get("symbol")
                 if symbol not in allowed or stock_info.get("status") != "ACTIVE":
                     continue
@@ -149,7 +149,7 @@ class UniverseBuilder:
         safe: list[UniverseCandidate] = []
         excluded_warning_types = set(self.settings.excluded_warning_types)
         for symbol in verified_symbols:
-            warnings = self.toss_client.get_stock_warnings(symbol)
+            warnings = extract_items(self.toss_client.get_stock_warnings(symbol), "warnings", "items")
             warning_types = {warning.get("warningType") for warning in warnings}
             if warning_types & excluded_warning_types:
                 continue

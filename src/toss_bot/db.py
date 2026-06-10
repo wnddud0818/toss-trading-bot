@@ -355,6 +355,10 @@ class BotRepository:
         with self.session_factory() as session:
             return list(session.scalars(select(TradeRow).order_by(TradeRow.ts.desc()).limit(limit)).all())
 
+    def trades_ordered(self) -> list[TradeRow]:
+        with self.session_factory() as session:
+            return list(session.scalars(select(TradeRow).order_by(TradeRow.ts.asc(), TradeRow.id.asc())).all())
+
     def latest_order_audits(self, limit: int = 200) -> list[OrderAuditRow]:
         with self.session_factory() as session:
             return list(session.scalars(select(OrderAuditRow).order_by(OrderAuditRow.ts.desc()).limit(limit)).all())

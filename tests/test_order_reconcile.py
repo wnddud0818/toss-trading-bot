@@ -50,3 +50,20 @@ def test_reconciler_cancels_stale_kr_open_orders(monkeypatch):
     assert report.canceled_orders == 1
     assert report.kept_orders == 1
     assert toss.canceled == ["old-order"]
+
+
+class TossBareListOrderStub(TossOrderStub):
+    def get_open_orders(self):
+        return super().get_open_orders()["orders"]
+
+
+def test_reconciler_handles_bare_list_payload(monkeypatch):
+    monkeypatch.setattr(order_reconcile, "now_kst", lambda: datetime(2026, 6, 10, 10, 0, tzinfo=KST))
+    toss = TossBareListOrderStub()
+    reconciler = OrderReconciler(ExecutionSettings(stale_order_minutes=3), toss)
+
+    report = reconciler.reconcile(cancel_stale=True)
+
+    assert report.open_orders == 2
+    assert report.canceled_orders == 1
+    assert toss.canceled == ["old-order"]

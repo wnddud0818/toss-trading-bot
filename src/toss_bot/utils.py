@@ -54,6 +54,18 @@ def make_client_order_id(symbol: str, side: OrderSide, prefix: str = "tb") -> st
     return compact[:36]
 
 
+def extract_items(payload: object, *keys: str) -> list:
+    """Toss API 응답이 리스트 그대로 오는 경우와 dict로 감싸져 오는 경우를 모두 흡수한다."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
 def parse_toss_candle(item: dict) -> Candle:
     return Candle(
         timestamp=datetime.fromisoformat(item["timestamp"]),

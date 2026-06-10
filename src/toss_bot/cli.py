@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 from datetime import date
+from decimal import Decimal
 
 from .backtest import Backtester
 from .config import load_settings
@@ -36,6 +37,13 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("--date", required=True)
 
     subparsers.add_parser("doctor")
+    subparsers.add_parser("status")
+
+    halt = subparsers.add_parser("halt")
+    halt.add_argument("--reason", default="manual halt")
+
+    resume = subparsers.add_parser("resume")
+    resume.add_argument("--reset-peak", action="store_true")
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -46,6 +54,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return _doctor(settings)
+    if args.command == "status":
+        return _status(settings, repository)
+    if args.command == "halt":
+        return _halt(repository, args.reason)
+    if args.command == "resume":
+        return _resume(repository, reset_peak=args.reset_peak)
     if args.command == "backtest":
         result = Backtester(settings).run(date.fromisoformat(args.from_date), date.fromisoformat(args.to_date))
         print(
@@ -86,6 +100,67 @@ def main(argv: list[str] | None = None) -> int:
         start_scheduler(settings, bot)
         return 0
     return 1
+
+
+def _status(settings, repository: BotRepository) -> int:
+    print(f"Mode: {settings.mode.value}")
+    state = repository.load_risk_state()
+    if state is None:
+        print("Risk state: not initialized (run the bot at least once)")
+        return 0
+    print(
+        f"Equity: {state.current_equity} "
+        f"(day start {state.start_day_equity}, week start {state.start_week_equity}, peak {state.peak_equity})"
+    )
+    print(f"Halted: {state.halted_reason or 'no'}")
+    if settings.mode == RunMode.PAPER:
+        cash = repository.get_cash(Decimal(settings.paper.initial_cash_krw))
+        positions = repository.list_positions()
+        print(f"Paper cash: {cash}")
+        print(f"Paper positions: {len(positions)}")
+        for position in positions:
+            print(
+                f"  {position.symbol} qty={position.quantity} entry={position.entry_price} "
+                f"high={position.high_watermark} since={position.entry_date}"
+            )
+    else:
+        print("Live positions are read from the broker at runtime; see daily reports for fills")
+    audits = repository.latest_order_audits(5)
+    if audits:
+        print("Recent orders:")
+        for audit in audits:
+            print(
+                f"  {audit.ts:%Y-%m-%d %H:%M} {audit.mode} {audit.side} {audit.symbol} "
+                f"x{audit.quantity} status={audit.status} {audit.reason}"
+            )
+    return 0
+
+
+def _halt(repository: BotRepository, reason: str) -> int:
+    state = repository.load_risk_state()
+    if state is None:
+        print("No risk state found; run the bot at least once first")
+        return 1
+    state.halted_reason = reason
+    repository.save_risk_state(state)
+    print(f"Trading halted: {reason}")
+    return 0
+
+
+def _resume(repository: BotRepository, *, reset_peak: bool) -> int:
+    state = repository.load_risk_state()
+    if state is None:
+        print("No risk state found; nothing to resume")
+        return 1
+    previous = state.halted_reason
+    state.halted_reason = None
+    if reset_peak:
+        state.peak_equity = state.current_equity
+    repository.save_risk_state(state)
+    if previous == "max drawdown reached" and not reset_peak:
+        print("Warning: peak equity unchanged; the max drawdown halt will trigger again (use --reset-peak after review)")
+    print(f"Trading resumed (cleared: {previous or 'none'})")
+    return 0
 
 
 def _doctor(settings) -> int:

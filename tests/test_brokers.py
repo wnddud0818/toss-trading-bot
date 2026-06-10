@@ -77,6 +77,9 @@ class LiveHoldingStub:
     def __init__(self):
         self.last_price = "72000"
 
+    def get_buying_power(self, currency="KRW"):
+        return {"cashBuyingPower": "1000000"}
+
     def get_holdings(self):
         return {
             "items": [
@@ -103,3 +106,14 @@ def test_live_broker_persists_position_metadata(tmp_path):
 
     assert second.entry_date == first.entry_date
     assert second.high_watermark == Decimal("75000.0000")
+
+
+def test_live_broker_marks_portfolio_with_last_price_not_high_watermark(tmp_path):
+    repository = BotRepository(init_db(f"sqlite:///{tmp_path / 'bot.sqlite3'}"))
+    broker = LiveBroker(live_settings(), LiveHoldingStub(), repository)
+    broker.positions()
+    broker.update_high_watermark("005930", Decimal("75000"))
+
+    value = broker.portfolio_value({})
+
+    assert value == Decimal("1000000") + Decimal("3") * Decimal("72000")
