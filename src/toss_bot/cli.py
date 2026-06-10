@@ -51,8 +51,10 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Backtest {result.start}..{result.end}: "
             f"{result.start_equity} -> {result.end_equity} "
-            f"return={result.total_return:.4%} trades={result.trades}"
+            f"return={result.total_return:.4%} trades={result.trades} method={result.method}"
         )
+        if result.warning:
+            print(f"Warning: {result.warning}")
         return 0
     if args.command == "report":
         path = ReportWriter(settings, repository).write_daily_report(date.fromisoformat(args.date))

@@ -7,6 +7,8 @@ from decimal import Decimal, ROUND_DOWN
 import pandas as pd
 
 from .config import Settings
+from .models import Candle, UniverseCandidate
+from .strategy import HybridMomentumStrategy
 from .utils import dec, money, quiet_external_data_source
 
 
@@ -18,6 +20,8 @@ class BacktestResult:
     end_equity: Decimal
     total_return: Decimal
     trades: int
+    method: str
+    warning: str | None = None
 
 
 class Backtester:
@@ -25,15 +29,18 @@ class Backtester:
         self.settings = settings
 
     def run(self, start: date, end: date) -> BacktestResult:
+        errors: list[str] = []
         try:
             with quiet_external_data_source():
                 return self._run_krx_rotation(start, end)
-        except Exception:
+        except Exception as exc:
+            errors.append(f"KRX: {exc}")
             try:
                 with quiet_external_data_source():
                     return self._run_fdr_rotation(start, end)
-            except Exception:
-                return self._fallback_cost_smoke(start, end)
+            except Exception as exc:
+                errors.append(f"FinanceDataReader: {exc}")
+                return self._fallback_cost_smoke(start, end, "; ".join(errors))
 
     def _run_krx_rotation(self, start: date, end: date) -> BacktestResult:
         from pykrx import stock
@@ -97,6 +104,8 @@ class Backtester:
             end_equity=end_equity,
             total_return=(end_equity / initial) - Decimal("1"),
             trades=trades,
+            method="daily_proxy_with_live_ranking",
+            warning="Proxy backtest: intraday breakout, orderbook execution, stops, and closing policy are not simulated.",
         )
 
     def _run_fdr_rotation(self, start: date, end: date) -> BacktestResult:
@@ -165,9 +174,11 @@ class Backtester:
             end_equity=end_equity,
             total_return=(end_equity / initial) - Decimal("1"),
             trades=trades,
+            method="daily_proxy_with_live_ranking",
+            warning="Proxy backtest: intraday breakout, orderbook execution, stops, and closing policy are not simulated.",
         )
 
-    def _fallback_cost_smoke(self, start: date, end: date) -> BacktestResult:
+    def _fallback_cost_smoke(self, start: date, end: date, error_summary: str = "") -> BacktestResult:
         initial = Decimal(self.settings.paper.initial_cash_krw)
         round_trip_cost = dec(self.settings.risk.commission_rate) * Decimal("2")
         round_trip_cost += dec(self.settings.risk.transaction_tax_rate)
@@ -181,6 +192,8 @@ class Backtester:
             end_equity=end_equity,
             total_return=(end_equity / initial) - Decimal("1"),
             trades=2,
+            method="cost_smoke",
+            warning=f"Historical data backtest unavailable; returned cost-only smoke result. {error_summary}".strip(),
         )
 
     def _top_liquidity_symbols(self, stock, as_of: date) -> list[str]:
@@ -220,22 +233,33 @@ class Backtester:
         return pd.DataFrame(series)
 
     def _rank_from_close_frame(self, closes: pd.DataFrame) -> list[str]:
-        scores: dict[str, Decimal] = {}
+        strategy = HybridMomentumStrategy(self.settings.strategy)
+        universe: list[UniverseCandidate] = []
+        daily: dict[str, list[Candle]] = {}
         for symbol in closes.columns:
             values = closes[symbol].dropna()
             if len(values) < max(self.settings.strategy.momentum_windows) + 1:
                 continue
-            latest = dec(values.iloc[-1])
-            weighted = Decimal("0")
-            for window, weight in zip(self.settings.strategy.momentum_windows, self.settings.strategy.momentum_weights):
-                previous = dec(values.iloc[-window - 1])
-                if previous <= 0:
+            candles: list[Candle] = []
+            for timestamp, raw_price in values.items():
+                price = dec(raw_price)
+                if price <= 0:
                     continue
-                weighted += (latest / previous - Decimal("1")) * dec(weight)
-            volatility = dec(values.pct_change().tail(self.settings.strategy.volatility_window).std() or 0.0001)
-            if volatility > 0:
-                scores[symbol] = weighted / volatility
-        return sorted(scores, key=scores.get, reverse=True)
+                candles.append(Candle(pd.Timestamp(timestamp).to_pydatetime(), price, price, price, price, Decimal("1")))
+            if len(candles) < max(self.settings.strategy.momentum_windows) + 1:
+                continue
+            daily[symbol] = candles
+            universe.append(
+                UniverseCandidate(
+                    symbol=symbol,
+                    name=symbol,
+                    market="KOSPI",
+                    trading_value=Decimal("100000000000"),
+                    close=candles[-1].close,
+                    volume=Decimal("1"),
+                )
+            )
+        return [candidate.symbol for candidate in strategy.rank_candidates(universe, daily)]
 
     def _equity(self, cash: Decimal, holdings: dict[str, Decimal], prices: pd.Series) -> Decimal:
         equity = cash

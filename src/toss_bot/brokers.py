@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
 from decimal import Decimal
 
 from .config import Settings
@@ -8,6 +7,9 @@ from .db import BotRepository
 from .models import OrderRequest, OrderResult, OrderSide, Position, RunMode
 from .toss_client import TossApiError, TossClient
 from .utils import dec, make_client_order_id, money, now_kst, qty
+
+
+OPEN_ORDER_STATUSES = {"PENDING", "PARTIAL_FILLED", "PENDING_CANCEL", "PENDING_REPLACE"}
 
 
 class PaperBroker:
@@ -86,7 +88,7 @@ class PaperBroker:
             average_price = ((existing.quantity * existing.entry_price) + (order.quantity * fill_price)) / new_quantity
             position = Position(order.symbol, new_quantity, average_price, existing.entry_date, max(existing.high_watermark, fill_price))
         else:
-            position = Position(order.symbol, order.quantity, fill_price, date.today(), fill_price)
+            position = Position(order.symbol, order.quantity, fill_price, now_kst().date(), fill_price)
         self.repository.set_cash(money(cash - total))
         self.repository.upsert_position(position)
 
@@ -126,9 +128,10 @@ class PaperBroker:
 
 
 class LiveBroker:
-    def __init__(self, settings: Settings, toss_client: TossClient):
+    def __init__(self, settings: Settings, toss_client: TossClient, repository: BotRepository | None = None):
         self.settings = settings
         self.toss_client = toss_client
+        self.repository = repository
         if settings.mode != RunMode.LIVE:
             raise RuntimeError("settings.mode must be live for LiveBroker")
         if not settings.enable_live_trading:
@@ -140,7 +143,7 @@ class LiveBroker:
         estimated_amount = (order.price or Decimal("0")) * order.quantity
         if estimated_amount > Decimal(self.settings.risk.max_live_order_amount_krw):
             raise RuntimeError("live order amount exceeds configured cap")
-        self._assert_no_opposite_open_order(order)
+        self._assert_no_conflicting_open_order(order)
         if order.side == OrderSide.BUY:
             buying_power = self.toss_client.get_buying_power("KRW")
             cash = dec(buying_power.get("cashBuyingPower", 0))
@@ -178,8 +181,9 @@ class LiveBroker:
     def positions(self) -> list[Position]:
         holdings = self.toss_client.get_holdings()
         items = holdings.get("items", holdings if isinstance(holdings, list) else [])
-        today = date.today()
+        today = now_kst().date()
         positions: list[Position] = []
+        active_symbols: set[str] = set()
         for item in items:
             if item.get("marketCountry") not in (None, "KR"):
                 continue
@@ -188,15 +192,26 @@ class LiveBroker:
                 continue
             entry_price = dec(item.get("averagePurchasePrice", item.get("lastPrice", 0)))
             last_price = dec(item.get("lastPrice", entry_price))
+            active_symbols.add(item["symbol"])
+            entry_date = today
+            high_watermark = max(entry_price, last_price)
+            if self.repository is not None:
+                meta = self.repository.get_position_meta(item["symbol"])
+                if meta is not None:
+                    entry_date, stored_high = meta
+                    high_watermark = max(stored_high, high_watermark)
+                self.repository.upsert_position_meta(item["symbol"], entry_date, high_watermark)
             positions.append(
                 Position(
                     symbol=item["symbol"],
                     quantity=quantity,
                     entry_price=entry_price,
-                    entry_date=today,
-                    high_watermark=max(entry_price, last_price),
+                    entry_date=entry_date,
+                    high_watermark=high_watermark,
                 )
             )
+        if self.repository is not None:
+            self.repository.prune_position_meta(active_symbols)
         return positions
 
     def portfolio_value(self, latest_prices: dict[str, Decimal] | None = None) -> Decimal:
@@ -206,10 +221,26 @@ class LiveBroker:
             equity += position.quantity * latest_prices.get(position.symbol, position.high_watermark)
         return money(equity)
 
-    def _assert_no_opposite_open_order(self, order: OrderRequest) -> None:
+    def update_high_watermark(self, symbol: str, high_watermark: Decimal) -> None:
+        if self.repository is None:
+            return
+        meta = self.repository.get_position_meta(symbol)
+        entry_date = now_kst().date()
+        current_high = Decimal("0")
+        if meta is not None:
+            entry_date, current_high = meta
+        if high_watermark > current_high:
+            self.repository.upsert_position_meta(symbol, entry_date, high_watermark)
+
+    def _assert_no_conflicting_open_order(self, order: OrderRequest) -> None:
         open_orders = self.toss_client.get_open_orders(order.symbol)
         orders = open_orders.get("orders", open_orders if isinstance(open_orders, list) else [])
-        opposite = OrderSide.SELL if order.side == OrderSide.BUY else OrderSide.BUY
         for open_order in orders:
-            if open_order.get("side") == opposite.value:
+            if open_order.get("status") not in OPEN_ORDER_STATUSES:
+                continue
+            side = open_order.get("side")
+            if side == order.side.value:
+                raise TossApiError(422, "same-side-pending-order-exists", "Same-side open order exists")
+            opposite = OrderSide.SELL if order.side == OrderSide.BUY else OrderSide.BUY
+            if side == opposite.value:
                 raise TossApiError(422, "opposite-pending-order-exists", "Opposite open order exists")

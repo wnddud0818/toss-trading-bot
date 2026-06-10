@@ -13,12 +13,12 @@ class MarketFilter:
         self.lookback_days = lookback_days
         self.ma_window = ma_window
 
-    def risk_on(self, as_of: date) -> bool:
+    def risk_on(self, as_of: date) -> bool | None:
         try:
             return self._index_above_ma(as_of, "1001") and self._index_above_ma(as_of, "2001")
         except Exception:
-            logger.exception("Market filter failed; blocking new entries")
-            return False
+            logger.exception("Market filter failed; blocking new entries without forcing risk-off exits")
+            return None
 
     def _index_above_ma(self, as_of: date, index_code: str) -> bool:
         from pykrx import stock

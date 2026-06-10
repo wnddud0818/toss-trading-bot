@@ -10,7 +10,7 @@ from .db import BotRepository
 from .execution import ExecutionPlanner
 from .market_calendar import KrMarketSession, parse_kr_market_session
 from .market_filter import MarketFilter
-from .models import Candle, OrderSide, RunMode, Signal
+from .models import Candle, OrderSide, OrderType, RunMode, Signal
 from .notifications import DiscordNotifier
 from .order_reconcile import OrderReconciler, ReconcileReport
 from .reports import ReportWriter
@@ -45,16 +45,24 @@ class TradingBot:
         self._session_cache_date = None
         self._session_cache: KrMarketSession | None = None
         equity = self.broker.portfolio_value({})
+        today = now_kst().date()
+        iso = today.isocalendar()
+        risk_state = repository.load_risk_state() or RiskState(
+            start_day_equity=equity,
+            start_week_equity=equity,
+            peak_equity=equity,
+            current_equity=equity,
+            trading_day=today,
+            iso_year=iso.year,
+            iso_week=iso.week,
+        )
         self.risk = RiskManager(
             settings.risk,
-            RiskState(
-                start_day_equity=equity,
-                start_week_equity=equity,
-                peak_equity=equity,
-                current_equity=equity,
-            ),
+            risk_state,
             {position.symbol: position for position in self.broker.positions()},
         )
+        self.risk.update_equity(equity, today)
+        self.repository.save_risk_state(self.risk.state)
 
     def preflight(self) -> None:
         self.toss_client.get_accounts()
@@ -81,15 +89,20 @@ class TradingBot:
             logger.info("Market loop skipped outside regular KR session: %s", session.label())
             return
         today = now_kst().date()
-        market_ok = self.market_filter.risk_on(today)
+        market_signal = self.market_filter.risk_on(today)
+        market_ok = market_signal is True
         positions = {position.symbol: position for position in self.broker.positions()}
         latest_prices = self._latest_prices(list(positions))
         equity = self.broker.portfolio_value(latest_prices)
         self.risk.positions = positions
-        self.risk.update_equity(equity)
+        self.risk.update_equity(equity, today)
+        self.repository.save_risk_state(self.risk.state)
         self.repository.record_equity(now_kst(), equity)
 
-        self._process_exits(positions, today, market_ok)
+        self._process_exits(positions, today, market_ok if market_signal is not None else True)
+        if market_signal is None:
+            logger.info("Market filter data unavailable; skipping entries without risk-off exits")
+            return
         if not market_ok:
             logger.info("Market filter is risk-off; skipping entries")
             return
@@ -105,9 +118,14 @@ class TradingBot:
                 continue
             latest = candles[-1]
             self._update_high_watermark(position.symbol, latest.high)
-            signal = self.strategy.exit_signal(position, candles, now_kst().date(), market_filter_ok=False)
-            if signal is None:
-                continue
+            signal = Signal(
+                symbol=position.symbol,
+                side=OrderSide.SELL,
+                order_type=OrderType.LIMIT,
+                quantity=position.quantity,
+                limit_price=latest.close,
+                reason="closing policy",
+            )
             self._place_signal(signal, urgent=True)
 
     def reconcile_open_orders(self, *, cancel_stale: bool | None = None) -> ReconcileReport:
@@ -202,4 +220,4 @@ class TradingBot:
     def _make_broker(self):
         if self.settings.mode == RunMode.PAPER:
             return PaperBroker(self.settings, self.repository)
-        return LiveBroker(self.settings, self.toss_client)
+        return LiveBroker(self.settings, self.toss_client, self.repository)

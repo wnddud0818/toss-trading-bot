@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 
-from sqlalchemy import Date, DateTime, Numeric, String, create_engine, select
+from sqlalchemy import Date, DateTime, Integer, Numeric, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .models import OrderRequest, OrderResult, OrderSide, Position, UniverseCandidate
@@ -43,6 +43,28 @@ class PaperCashRow(Base):
 
     key: Mapped[str] = mapped_column(String(16), primary_key=True, default="KRW")
     cash: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+
+
+class RiskStateRow(Base):
+    __tablename__ = "risk_state"
+
+    key: Mapped[str] = mapped_column(String(16), primary_key=True, default="default")
+    start_day_equity: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    start_week_equity: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    peak_equity: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    current_equity: Mapped[Decimal] = mapped_column(Numeric(20, 4))
+    trading_day: Mapped[date | None] = mapped_column(Date, nullable=True)
+    iso_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    iso_week: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    halted_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class PositionMetaRow(Base):
+    __tablename__ = "position_meta"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    entry_date: Mapped[date] = mapped_column(Date)
+    high_watermark: Mapped[Decimal] = mapped_column(Numeric(20, 4))
 
 
 class TradeRow(Base):
@@ -197,6 +219,76 @@ class BotRepository:
                 session.add(row)
             else:
                 row.cash = cash
+            session.commit()
+
+    def load_risk_state(self):
+        from .risk import RiskState
+
+        with self.session_factory() as session:
+            row = session.get(RiskStateRow, "default")
+            if row is None:
+                return None
+            return RiskState(
+                start_day_equity=row.start_day_equity,
+                start_week_equity=row.start_week_equity,
+                peak_equity=row.peak_equity,
+                current_equity=row.current_equity,
+                trading_day=row.trading_day,
+                iso_year=row.iso_year,
+                iso_week=row.iso_week,
+                halted_reason=row.halted_reason,
+            )
+
+    def save_risk_state(self, state) -> None:
+        with self.session_factory() as session:
+            row = session.get(RiskStateRow, "default")
+            if row is None:
+                row = RiskStateRow(
+                    key="default",
+                    start_day_equity=state.start_day_equity,
+                    start_week_equity=state.start_week_equity,
+                    peak_equity=state.peak_equity,
+                    current_equity=state.current_equity,
+                    trading_day=state.trading_day,
+                    iso_year=state.iso_year,
+                    iso_week=state.iso_week,
+                    halted_reason=state.halted_reason,
+                )
+                session.add(row)
+            else:
+                row.start_day_equity = state.start_day_equity
+                row.start_week_equity = state.start_week_equity
+                row.peak_equity = state.peak_equity
+                row.current_equity = state.current_equity
+                row.trading_day = state.trading_day
+                row.iso_year = state.iso_year
+                row.iso_week = state.iso_week
+                row.halted_reason = state.halted_reason
+            session.commit()
+
+    def get_position_meta(self, symbol: str) -> tuple[date, Decimal] | None:
+        with self.session_factory() as session:
+            row = session.get(PositionMetaRow, symbol)
+            if row is None:
+                return None
+            return row.entry_date, row.high_watermark
+
+    def upsert_position_meta(self, symbol: str, entry_date: date, high_watermark: Decimal) -> None:
+        with self.session_factory() as session:
+            row = session.get(PositionMetaRow, symbol)
+            if row is None:
+                session.add(PositionMetaRow(symbol=symbol, entry_date=entry_date, high_watermark=high_watermark))
+            else:
+                row.entry_date = entry_date
+                row.high_watermark = high_watermark
+            session.commit()
+
+    def prune_position_meta(self, active_symbols: set[str]) -> None:
+        with self.session_factory() as session:
+            rows = session.scalars(select(PositionMetaRow)).all()
+            for row in rows:
+                if row.symbol not in active_symbols:
+                    session.delete(row)
             session.commit()
 
     def record_trade(
