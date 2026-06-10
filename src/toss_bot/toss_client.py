@@ -128,8 +128,9 @@ class TossClient:
     def get_stock_warnings(self, symbol: str) -> Any:
         return self.request("GET", f"/api/v1/stocks/{symbol}/warnings")
 
-    def get_market_calendar(self, country: str = "KR") -> Any:
-        return self.request("GET", f"/api/v1/market-calendar/{country}")
+    def get_market_calendar(self, country: str = "KR", date: str | None = None) -> Any:
+        params = {"date": date} if date else None
+        return self.request("GET", f"/api/v1/market-calendar/{country}", params=params)
 
     def get_exchange_rate(self, base_currency: str = "USD", quote_currency: str = "KRW") -> Any:
         return self.request(

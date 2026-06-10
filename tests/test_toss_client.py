@@ -91,12 +91,12 @@ def test_market_calendar_and_exchange_rate_wrappers_use_market_info_endpoints():
     settings = Settings(toss_client_id="id", toss_client_secret="secret")
     client = TossClient(settings, httpx.Client(transport=httpx.MockTransport(handler), base_url=settings.toss.base_url))
 
-    calendar = client.get_market_calendar("US")
+    calendar = client.get_market_calendar("US", "2026-06-10")
     rate = client.get_exchange_rate("USD", "KRW")
 
     assert calendar["today"]["date"] == "2026-06-10"
     assert rate["midRate"] == "1399"
-    assert ("/api/v1/market-calendar/US", {}) in seen
+    assert ("/api/v1/market-calendar/US", {"date": "2026-06-10"}) in seen
     assert ("/api/v1/exchange-rate", {"baseCurrency": "USD", "quoteCurrency": "KRW"}) in seen
 
 

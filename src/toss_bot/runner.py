@@ -4,6 +4,7 @@ import logging
 import time
 from datetime import date
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from .brokers import LiveBroker, PaperBroker
 from .config import Settings
@@ -26,6 +27,7 @@ from .utils import dec, extract_items, now_kst, parse_toss_candle
 logger = logging.getLogger(__name__)
 
 SESSION_CACHE_TTL_SECONDS = 1800
+US_EASTERN = ZoneInfo("America/New_York")
 
 
 class TradingBot:
@@ -65,7 +67,7 @@ class TradingBot:
         self.market_filter = MarketFilter(toss_client)
         self.report_writer = ReportWriter(settings, repository)
         self.broker = self._make_broker()
-        self._session_cache: dict[MarketCountry, tuple[float, MarketSession]] = {}
+        self._session_cache: dict[tuple[MarketCountry, date], tuple[float, MarketSession]] = {}
         equity = self.broker.portfolio_value({})
         today = now_kst().date()
         iso = today.isocalendar()
@@ -97,7 +99,7 @@ class TradingBot:
         if market not in self.universe_builders:
             logger.info("Universe refresh skipped: market %s disabled", market)
             return
-        as_of = as_of or now_kst().date()
+        as_of = as_of or _market_date(market, now_kst())
         candidates = self.universe_builders[market].refresh(as_of)
         self.notifier.send(f"[toss-bot] {market} universe refreshed: {len(candidates)} candidates")
 
@@ -117,7 +119,7 @@ class TradingBot:
         if not session.orders_open(now):
             logger.info("Market loop skipped outside %s regular session: %s", market, session.label())
             return
-        today = now.date()
+        today = _market_date(market, now)
         market_signal = self.market_filter.risk_on(market, today)
         market_ok = market_signal is True
         all_positions = self.broker.positions()
@@ -185,7 +187,7 @@ class TradingBot:
     def _process_entries(self, market: MarketCountry) -> None:
         profile = self.profiles[market]
         currency = currency_for(market)
-        today = now_kst().date()
+        today = _market_date(market, now_kst())
         cash_local = self.broker.cash(currency)
         cash_krw = self.fx.to_krw(cash_local, currency)
         open_count = sum(
@@ -280,15 +282,24 @@ class TradingBot:
 
     def _market_session(self, market: MarketCountry) -> MarketSession:
         # 미국 세션은 KST 자정을 넘기므로 날짜 기준 캐시 대신 TTL 캐시를 쓴다.
-        cached = self._session_cache.get(market)
+        now = now_kst()
+        calendar_date = _market_date(market, now)
+        cache_key = (market, calendar_date)
+        cached = self._session_cache.get(cache_key)
         if cached is not None and time.time() - cached[0] < SESSION_CACHE_TTL_SECONDS:
             return cached[1]
-        payload = self.toss_client.get_market_calendar(str(market))
-        session = parse_market_session(payload, market, self.profiles[market].strategy.entry_cutoff_minutes)
-        self._session_cache[market] = (time.time(), session)
+        payload = self.toss_client.get_market_calendar(str(market), calendar_date.isoformat())
+        session = parse_market_session(payload, market, self.profiles[market].strategy.entry_cutoff_minutes, now)
+        self._session_cache[cache_key] = (time.time(), session)
         return session
 
     def _make_broker(self):
         if self.settings.mode == RunMode.PAPER:
             return PaperBroker(self.settings, self.repository, self.fx)
         return LiveBroker(self.settings, self.toss_client, self.repository, self.fx)
+
+
+def _market_date(market: MarketCountry, now) -> date:
+    if market == MarketCountry.US:
+        return now.astimezone(US_EASTERN).date()
+    return now.date()

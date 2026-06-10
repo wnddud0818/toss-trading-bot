@@ -81,6 +81,25 @@ def test_paper_broker_portfolio_value_converts_usd_to_krw(tmp_path):
     assert value == expected
 
 
+def test_paper_broker_rejects_disabled_us_market(tmp_path):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'paper.sqlite3'}",
+        markets={"US": {"enabled": False}},
+    )
+    repository = BotRepository(init_db(settings.database_url))
+    broker = PaperBroker(settings, repository, FakeFx())
+
+    try:
+        broker.place_order(
+            OrderRequest("AAPL", OrderSide.BUY, OrderType.LIMIT, Decimal("1"), Decimal("100")),
+            reason="test",
+        )
+    except ValueError as exc:
+        assert "US market is disabled" in str(exc)
+    else:
+        raise AssertionError("disabled US market order should be blocked")
+
+
 def test_live_broker_requires_double_lock():
     settings = Settings(mode=RunMode.LIVE, enable_live_trading=False)
 
@@ -138,6 +157,22 @@ def test_live_broker_caps_us_order_amount_in_krw():
         assert "order amount exceeds" in str(exc)
     else:
         raise AssertionError("US order above the KRW cap should be blocked")
+
+
+def test_live_broker_rejects_disabled_us_market_before_api_calls():
+    settings = live_settings()
+    settings.markets["US"].enabled = False
+    broker = LiveBroker(settings, LiveOrderStub([]), fx=FakeFx("1400"))
+
+    try:
+        broker.place_order(
+            OrderRequest("AAPL", OrderSide.BUY, OrderType.LIMIT, Decimal("1"), Decimal("100")),
+            reason="test",
+        )
+    except RuntimeError as exc:
+        assert "US market is disabled" in str(exc)
+    else:
+        raise AssertionError("disabled US market live order should be blocked")
 
 
 class LiveHoldingStub:

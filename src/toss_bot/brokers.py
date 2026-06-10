@@ -19,6 +19,7 @@ class PaperBroker:
         self.settings = settings
         self.repository = repository
         self.fx = fx
+        self._enabled_markets = set(settings.enabled_markets())
 
     def cash(self, currency: Currency = Currency.KRW) -> Decimal:
         initial = (
@@ -66,6 +67,8 @@ class PaperBroker:
         if order.price is None:
             raise ValueError("PaperBroker requires price for simulated fills")
         market = market_for_symbol(order.symbol)
+        if market not in self._enabled_markets:
+            raise ValueError(f"{market} market is disabled")
         currency = currency_for(market)
         costs = self.settings.market_profile(market).costs
         fill_price = self._fill_price(order, costs, currency)
@@ -171,7 +174,7 @@ class LiveBroker:
         self.settings = settings
         self.toss_client = toss_client
         self.repository = repository
-        self.fx = fx
+        self.fx = fx or FxRateProvider(toss_client, settings.fx)
         self._last_prices: dict[str, Decimal] = {}
         self._allowed_countries = {str(market) for market in settings.enabled_markets()}
         if settings.mode != RunMode.LIVE:
@@ -183,6 +186,8 @@ class LiveBroker:
 
     def place_order(self, order: OrderRequest, reason: str = "") -> OrderResult:
         market = market_for_symbol(order.symbol)
+        if str(market) not in self._allowed_countries:
+            raise RuntimeError(f"{market} market is disabled")
         currency = currency_for(market)
         estimated_amount = (order.price or Decimal("0")) * order.quantity
         estimated_krw = estimated_amount if currency == Currency.KRW else estimated_amount * self._usd_krw()
@@ -269,7 +274,7 @@ class LiveBroker:
         latest_prices = latest_prices or {}
         usd_krw = self._usd_krw()
         equity = self.cash(Currency.KRW)
-        if "US" in self._allowed_countries and self.fx is not None:
+        if "US" in self._allowed_countries:
             equity += self.cash(Currency.USD) * usd_krw
         for position in self.positions():
             # high_watermark로 마킹하면 자산이 과대평가되어 손실 한도 감지가 늦어진다.
@@ -292,8 +297,6 @@ class LiveBroker:
             self.repository.upsert_position_meta(symbol, entry_date, high_watermark)
 
     def _usd_krw(self) -> Decimal:
-        if self.fx is None:
-            return Decimal("0")
         return self.fx.usd_krw()
 
     def _assert_no_conflicting_open_order(self, order: OrderRequest) -> None:

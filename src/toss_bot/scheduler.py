@@ -97,10 +97,11 @@ def start_scheduler(settings: Settings, bot: TradingBot) -> None:
             start_date=started_at,
         )
 
+    report_days = "mon-sat" if MarketCountry.US in enabled else "mon-fri"
     scheduler.add_job(
         bot.daily_report,
         "cron",
-        day_of_week="mon-fri",
+        day_of_week=report_days,
         hour=_hour(settings.schedule.report_time),
         minute=_minute(settings.schedule.report_time),
     )

@@ -13,7 +13,11 @@ from toss_bot.utils import KST
 
 
 class TossRunnerStub:
-    def get_market_calendar(self, country="KR"):
+    def __init__(self):
+        self.calendar_calls = []
+
+    def get_market_calendar(self, country="KR", date=None):
+        self.calendar_calls.append((country, date))
         if country == "KR":
             return {
                 "today": {
@@ -87,7 +91,7 @@ class TossMarketDataStub(TossRunnerStub):
 
 
 class ClosedMarketStub(TossRunnerStub):
-    def get_market_calendar(self, country="KR"):
+    def get_market_calendar(self, country="KR", date=None):
         if country == "KR":
             return {"today": {"date": "2026-06-13", "integrated": None}}
         return {"today": {"date": "2026-06-13", "regularMarket": None}}
@@ -192,7 +196,8 @@ def test_market_loop_adopts_externally_stored_halt(tmp_path, monkeypatch):
 def test_us_loop_runs_after_kst_midnight_and_exits_position(tmp_path, monkeypatch):
     # KST 새벽 3시 = 미국 정규장 한복판. 자정을 넘긴 세션에서도 청산이 동작해야 한다.
     monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 11, 3, 0, tzinfo=KST))
-    bot, repository = make_bot(tmp_path, UsMarketDataStub())
+    toss = UsMarketDataStub()
+    bot, repository = make_bot(tmp_path, toss)
     bot.market_filter = RiskOnMarketFilter()
     # entry 100 → 현재가 90: 6% 고정 손절에 걸린다
     repository.upsert_position(Position("AAPL", Decimal("10"), Decimal("100"), date(2026, 6, 9), Decimal("100")))
@@ -208,6 +213,7 @@ def test_us_loop_runs_after_kst_midnight_and_exits_position(tmp_path, monkeypatc
     bot.market_loop_once(MarketCountry.US)
 
     assert ("AAPL", "SELL") in placed
+    assert ("US", "2026-06-10") in toss.calendar_calls
 
 
 def test_us_entries_blocked_by_reentry_cooldown(tmp_path, monkeypatch):
