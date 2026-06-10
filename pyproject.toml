@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toss-trading-bot"
+version = "0.1.0"
+description = "Aggressive KR equity auto-trading bot for Toss Invest OpenAPI"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "apscheduler>=3.10.4",
+    "finance-datareader>=0.9.90",
+    "httpx>=0.27.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "pydantic>=2.7.0",
+    "pykrx>=1.0.48",
+    "python-dotenv>=1.0.1",
+    "PyYAML>=6.0.1",
+    "sqlalchemy>=2.0.30",
+    "tenacity>=8.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+]
+
+[project.scripts]
+toss-bot = "toss_bot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

@@ -1,0 +1,98 @@
+mode: paper
+timezone: Asia/Seoul
+database_url: sqlite:///data/toss_bot.sqlite3
+reports_dir: reports
+
+paper:
+  initial_cash_krw: 10000000
+
+toss:
+  base_url: https://openapi.tossinvest.com
+  token_refresh_margin_seconds: 60
+  timeout_seconds: 10
+
+universe:
+  markets: [KOSPI, KOSDAQ]
+  liquidity_top_n: 200
+  watch_top_n: 60
+  min_trading_value_krw: 3000000000
+  include_etf: false
+  excluded_warning_types:
+    - LIQUIDATION_TRADING
+    - OVERHEATED
+    - INVESTMENT_WARNING
+    - INVESTMENT_RISK
+    - VI_STATIC
+    - VI_DYNAMIC
+    - VI_STATIC_AND_DYNAMIC
+    - STOCK_WARRANTS
+
+strategy:
+  max_positions: 8
+  momentum_windows: [20, 60, 120]
+  momentum_weights: [0.50, 0.30, 0.20]
+  volatility_window: 20
+  trend_quality_weight: 0.20
+  volume_accumulation_weight: 0.10
+  high_proximity_weight: 0.10
+  liquidity_weight: 0.10
+  min_score: 0.5
+  min_20d_return_pct: 0.03
+  min_60d_return_pct: 0.05
+  max_5d_return_pct: 0.25
+  max_drawdown_from_high_pct: 0.30
+  min_volume_accumulation_ratio: 0.85
+  max_distance_from_ma20_pct: 0.18
+  max_gap_up_pct: 0.07
+  max_intraday_extension_pct: 0.08
+  breakout_buffer_pct: 0.001
+  require_trend_alignment: true
+  require_vwap_confirmation: true
+  volume_spike_multiplier: 1.5
+  intraday_box_minutes: 20
+  stop_loss_pct: 0.04
+  trailing_stop_pct: 0.03
+  breakeven_trigger_pct: 0.025
+  breakeven_buffer_pct: 0.003
+  profit_lock_trigger_pct: 0.08
+  profit_lock_trailing_stop_pct: 0.02
+  daily_drop_exit_pct: 0.035
+  max_holding_days: 10
+  new_entries_cutoff: "15:20"
+  forced_exit_window_start: "15:25"
+  forced_exit_window_end: "15:30"
+
+risk:
+  max_symbol_weight: 0.18
+  min_cash_weight: 0.10
+  target_position_volatility_pct: 0.025
+  max_entry_risk_pct: 0.008
+  min_order_amount_krw: 50000
+  daily_loss_limit_pct: 0.03
+  weekly_loss_limit_pct: 0.08
+  max_drawdown_pct: 0.15
+  max_live_order_amount_krw: 1000000
+  min_paper_trading_days: 20
+  paper_trading_days_completed: 0
+  commission_rate: 0.00015
+  transaction_tax_rate: 0.002
+  slippage_bps: 8
+
+execution:
+  max_entry_spread_bps: 25
+  max_exit_spread_bps: 80
+  max_chase_bps: 20
+  max_orderbook_participation: 0.25
+  price_limit_buffer_pct: 0.01
+  stale_order_minutes: 3
+  cancel_stale_orders: true
+
+schedule:
+  preflight_time: "08:30"
+  premarket_report_time: "08:50"
+  market_loop_start: "09:00"
+  market_loop_end: "15:20"
+  close_policy_start: "15:25"
+  close_policy_end: "15:30"
+  reconcile_interval_minutes: 5
+  report_time: "15:40"
