@@ -6,42 +6,55 @@ from decimal import Decimal
 import toss_bot.runner as runner
 from toss_bot.config import Settings
 from toss_bot.db import BotRepository, init_db
-from toss_bot.models import Position
+from toss_bot.models import MarketCountry, OrderSide, Position
 from toss_bot.notifications import DiscordNotifier
 from toss_bot.runner import TradingBot
 from toss_bot.utils import KST
 
 
 class TossRunnerStub:
-    def get_kr_market_calendar(self):
-        return {
-            "today": {
-                "integrated": {
-                    "regularMarket": {
-                        "startTime": "2026-06-10T09:00:00+09:00",
-                        "singlePriceAuctionStartTime": "2026-06-10T15:20:00+09:00",
-                        "endTime": "2026-06-10T15:30:00+09:00",
+    def get_market_calendar(self, country="KR"):
+        if country == "KR":
+            return {
+                "today": {
+                    "integrated": {
+                        "regularMarket": {
+                            "startTime": "2026-06-10T09:00:00+09:00",
+                            "singlePriceAuctionStartTime": "2026-06-10T15:20:00+09:00",
+                            "endTime": "2026-06-10T15:30:00+09:00",
+                        }
                     }
                 }
             }
+        return {
+            "today": {
+                "date": "2026-06-10",
+                "regularMarket": {
+                    "startTime": "2026-06-10T22:30:00+09:00",
+                    "endTime": "2026-06-11T05:00:00+09:00",
+                },
+            }
         }
+
+    def get_exchange_rate(self, base_currency="USD", quote_currency="KRW"):
+        return {"midRate": "1400", "rate": "1405"}
 
 
 class NullNotifier(DiscordNotifier):
     def __init__(self):
-        pass
+        self.last_message = ""
 
     def send(self, message: str) -> None:
         self.last_message = message
 
 
 class UnavailableMarketFilter:
-    def risk_on(self, as_of):
+    def risk_on(self, market, as_of):
         return None
 
 
 class RiskOnMarketFilter:
-    def risk_on(self, as_of):
+    def risk_on(self, market, as_of):
         return True
 
 
@@ -73,34 +86,63 @@ class TossMarketDataStub(TossRunnerStub):
         return {"upperLimitPrice": "13000", "lowerLimitPrice": "7000"}
 
 
-class ClosedMarketStub:
-    def get_kr_market_calendar(self):
-        return {"today": {"integrated": {"regularMarket": {}}}}
+class ClosedMarketStub(TossRunnerStub):
+    def get_market_calendar(self, country="KR"):
+        if country == "KR":
+            return {"today": {"date": "2026-06-13", "integrated": None}}
+        return {"today": {"date": "2026-06-13", "regularMarket": None}}
+
+
+class UsMarketDataStub(TossMarketDataStub):
+    def get_candles(self, symbol, interval, count):
+        return {
+            "candles": [
+                {
+                    "timestamp": "2026-06-10T23:30:00+09:00",
+                    "openPrice": "90.00",
+                    "highPrice": "90.50",
+                    "lowPrice": "89.50",
+                    "closePrice": "90.00",
+                    "volume": "1000",
+                }
+            ]
+        }
+
+    def get_prices(self, symbols):
+        return {"prices": [{"symbol": symbol, "lastPrice": "90.00"} for symbol in symbols]}
+
+    def get_orderbook(self, symbol):
+        return {
+            "asks": [{"price": "90.05", "volume": "100000"}],
+            "bids": [{"price": "90.00", "volume": "100000"}],
+        }
+
+
+def make_bot(tmp_path, toss_stub):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'runner.sqlite3'}")
+    repository = BotRepository(init_db(settings.database_url))
+    return TradingBot(settings, repository, toss_stub, NullNotifier()), repository
 
 
 def test_market_filter_unavailable_does_not_force_risk_off_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 10, 10, 0, tzinfo=KST))
-    settings = Settings(database_url=f"sqlite:///{tmp_path / 'runner.sqlite3'}")
-    repository = BotRepository(init_db(settings.database_url))
-    bot = TradingBot(settings, repository, TossRunnerStub(), NullNotifier())
+    bot, _ = make_bot(tmp_path, TossRunnerStub())
     bot.market_filter = UnavailableMarketFilter()
     seen = []
 
-    def fake_process_exits(positions, today, market_ok):
+    def fake_process_exits(market, positions, today, market_ok):
         seen.append(market_ok)
 
     bot._process_exits = fake_process_exits
 
-    bot.market_loop_once()
+    bot.market_loop_once(MarketCountry.KR)
 
     assert seen == [True]
 
 
 def test_exit_failure_does_not_block_other_positions(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 10, 10, 0, tzinfo=KST))
-    settings = Settings(database_url=f"sqlite:///{tmp_path / 'runner.sqlite3'}")
-    repository = BotRepository(init_db(settings.database_url))
-    bot = TradingBot(settings, repository, TossMarketDataStub(), NullNotifier())
+    bot, repository = make_bot(tmp_path, TossMarketDataStub())
     repository.upsert_position(Position("000001", Decimal("10"), Decimal("10000"), date(2026, 6, 9), Decimal("10000")))
     repository.upsert_position(Position("000002", Decimal("10"), Decimal("10000"), date(2026, 6, 9), Decimal("10000")))
     placed = []
@@ -115,36 +157,84 @@ def test_exit_failure_does_not_block_other_positions(tmp_path, monkeypatch):
     monkeypatch.setattr(bot.broker, "place_order", flaky_place_order)
     positions = {position.symbol: position for position in bot.broker.positions()}
 
-    bot._process_exits(positions, date(2026, 6, 10), True)
+    bot._process_exits(MarketCountry.KR, positions, date(2026, 6, 10), True)
 
     assert placed == ["000002"]
 
 
-def test_close_policy_skipped_on_non_business_day(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 13, 15, 25, tzinfo=KST))
-    settings = Settings(database_url=f"sqlite:///{tmp_path / 'runner.sqlite3'}")
-    repository = BotRepository(init_db(settings.database_url))
-    bot = TradingBot(settings, repository, ClosedMarketStub(), NullNotifier())
+def test_market_loop_skipped_when_session_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 13, 10, 0, tzinfo=KST))
+    bot, _ = make_bot(tmp_path, ClosedMarketStub())
 
     def fail_positions():
         raise AssertionError("positions should not be queried when the market is closed")
 
     monkeypatch.setattr(bot.broker, "positions", fail_positions)
 
-    bot.close_policy()
+    bot.market_loop_once(MarketCountry.KR)
+    bot.market_loop_once(MarketCountry.US)
 
 
 def test_market_loop_adopts_externally_stored_halt(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 10, 10, 0, tzinfo=KST))
-    settings = Settings(database_url=f"sqlite:///{tmp_path / 'runner.sqlite3'}")
-    repository = BotRepository(init_db(settings.database_url))
-    bot = TradingBot(settings, repository, TossRunnerStub(), NullNotifier())
+    bot, repository = make_bot(tmp_path, TossRunnerStub())
     bot.market_filter = RiskOnMarketFilter()
     state = repository.load_risk_state()
     state.halted_reason = "manual halt"
     repository.save_risk_state(state)
 
-    bot.market_loop_once()
+    bot.market_loop_once(MarketCountry.KR)
 
     assert bot.risk.state.halted_reason == "manual halt"
     assert "trading halted: manual halt" in bot.notifier.last_message
+
+
+def test_us_loop_runs_after_kst_midnight_and_exits_position(tmp_path, monkeypatch):
+    # KST 새벽 3시 = 미국 정규장 한복판. 자정을 넘긴 세션에서도 청산이 동작해야 한다.
+    monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 11, 3, 0, tzinfo=KST))
+    bot, repository = make_bot(tmp_path, UsMarketDataStub())
+    bot.market_filter = RiskOnMarketFilter()
+    # entry 100 → 현재가 90: 6% 고정 손절에 걸린다
+    repository.upsert_position(Position("AAPL", Decimal("10"), Decimal("100"), date(2026, 6, 9), Decimal("100")))
+    placed = []
+    original_place_order = bot.broker.place_order
+
+    def recording_place_order(order, reason=""):
+        placed.append((order.symbol, str(order.side)))
+        return original_place_order(order, reason=reason)
+
+    monkeypatch.setattr(bot.broker, "place_order", recording_place_order)
+
+    bot.market_loop_once(MarketCountry.US)
+
+    assert ("AAPL", "SELL") in placed
+
+
+def test_us_entries_blocked_by_reentry_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 11, 3, 0, tzinfo=KST))
+    bot, repository = make_bot(tmp_path, UsMarketDataStub())
+    bot.market_filter = RiskOnMarketFilter()
+    # 이틀 전 매도 기록 → 쿨다운 5일 이내라 재진입 금지
+    repository.record_trade(
+        ts=datetime(2026, 6, 9, 23, 50, tzinfo=KST),
+        mode="paper",
+        symbol="NVDA",
+        side=OrderSide.SELL,
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        commission=Decimal("0"),
+        tax=Decimal("0"),
+        reason="exit",
+    )
+    entered = []
+    bot._place_signal = lambda market, signal, urgent: entered.append(signal.symbol)
+
+    class FakeCandidate:
+        symbol = "NVDA"
+        volatility = Decimal("0.03")
+
+    bot._ranked_candidates = lambda market: [FakeCandidate()]
+
+    bot._process_entries(MarketCountry.US)
+
+    assert entered == []

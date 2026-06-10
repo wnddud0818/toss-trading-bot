@@ -35,13 +35,21 @@ class RiskManager:
             self.state.peak_equity = equity
         self._refresh_halt()
 
-    def can_enter(self, symbol: str, cash: Decimal, max_positions: int | None = None) -> tuple[bool, str]:
+    def can_enter(
+        self,
+        symbol: str,
+        cash: Decimal,
+        max_positions: int | None = None,
+        open_positions: int | None = None,
+    ) -> tuple[bool, str]:
+        """cash와 equity는 원화 환산 기준. open_positions를 주면 시장별 포지션 수로 한도를 센다."""
         self._refresh_halt()
         if self.state.halted_reason:
             return False, self.state.halted_reason
         if symbol in self.positions:
             return False, "already holding symbol"
-        if max_positions is not None and len(self.positions) >= max_positions:
+        count = len(self.positions) if open_positions is None else open_positions
+        if max_positions is not None and count >= max_positions:
             return False, "max positions reached"
         min_cash = self.state.current_equity * dec(self.settings.min_cash_weight)
         if cash <= min_cash:
@@ -63,10 +71,8 @@ class RiskManager:
             gross_budget *= min(Decimal("1"), max(Decimal("0.25"), vol_scale))
         min_cash = self.state.current_equity * dec(self.settings.min_cash_weight)
         spendable_cash = max(cash - min_cash, Decimal("0"))
-        budget = money(min(gross_budget, spendable_cash))
-        if budget < Decimal(self.settings.min_order_amount_krw):
-            return Decimal("0")
-        return budget
+        # 최소 주문 금액은 시장 통화가 다르므로 호출부에서 시장별 비용 설정으로 검사한다.
+        return money(min(gross_budget, spendable_cash))
 
     def _roll_periods(self, as_of: date, equity: Decimal) -> None:
         iso = as_of.isocalendar()

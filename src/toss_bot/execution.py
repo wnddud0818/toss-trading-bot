@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from .config import ExecutionSettings, RiskSettings
-from .models import OrderRequest, OrderSide, OrderType, Signal
+from .config import CostSettings, ExecutionSettings
+from .markets import align_price
+from .models import MarketCountry, OrderRequest, OrderSide, OrderType, Signal
 from .toss_client import TossClient
-from .utils import align_kr_price, dec, money, qty
+from .utils import dec, qty
 
 
 @dataclass(frozen=True)
@@ -18,16 +19,24 @@ class ExecutionPlan:
 
 
 class ExecutionPlanner:
-    def __init__(self, settings: ExecutionSettings, risk_settings: RiskSettings, toss_client: TossClient):
+    def __init__(
+        self,
+        settings: ExecutionSettings,
+        costs: CostSettings,
+        toss_client: TossClient,
+        market: MarketCountry = MarketCountry.KR,
+    ):
         self.settings = settings
-        self.risk_settings = risk_settings
+        self.costs = costs
         self.toss_client = toss_client
+        self.market = market
 
     def plan(self, signal: Signal, *, urgent: bool = False) -> ExecutionPlan:
         if signal.limit_price is None:
             return ExecutionPlan(False, "limit price is required")
         orderbook = self.toss_client.get_orderbook(signal.symbol)
-        price_limit = self.toss_client.get_price_limit(signal.symbol)
+        # 미국 주식은 상하한가가 없으므로(price-limits가 null) 조회를 생략한다.
+        price_limit = self.toss_client.get_price_limit(signal.symbol) if self.market == MarketCountry.KR else {}
         asks = _levels(orderbook.get("asks", []), reverse=False)
         bids = _levels(orderbook.get("bids", []), reverse=True)
         if not asks or not bids:
@@ -61,9 +70,9 @@ class ExecutionPlanner:
         if capped_quantity <= 0:
             return ExecutionPlan(False, "insufficient ask depth", spread_bps=spread_bps)
         best_price = executable[0][0]
-        if capped_quantity * best_price < Decimal(self.risk_settings.min_order_amount_krw):
+        if capped_quantity * best_price < Decimal(self.costs.min_order_amount):
             return ExecutionPlan(False, "order amount below minimum", spread_bps=spread_bps)
-        price = align_kr_price(best_price, side=OrderSide.BUY.value)
+        price = align_price(best_price, side=OrderSide.BUY.value, market=self.market)
         return ExecutionPlan(
             True,
             "accepted",
@@ -88,7 +97,7 @@ class ExecutionPlanner:
         capped_quantity = qty(min(signal.quantity, available * dec(self.settings.max_orderbook_participation)))
         if capped_quantity <= 0:
             return ExecutionPlan(False, "insufficient bid depth", spread_bps=spread_bps)
-        price = align_kr_price(executable[0][0], side=OrderSide.SELL.value)
+        price = align_price(executable[0][0], side=OrderSide.SELL.value, market=self.market)
         return ExecutionPlan(
             True,
             "accepted",

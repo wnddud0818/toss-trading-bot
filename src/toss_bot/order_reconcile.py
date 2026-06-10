@@ -26,9 +26,15 @@ class ReconcileReport:
 
 
 class OrderReconciler:
-    def __init__(self, settings: ExecutionSettings, toss_client: TossClient):
+    def __init__(
+        self,
+        settings: ExecutionSettings,
+        toss_client: TossClient,
+        allowed_currencies: set[str] | None = None,
+    ):
         self.settings = settings
         self.toss_client = toss_client
+        self.allowed_currencies = allowed_currencies or {"KRW", "USD"}
 
     def reconcile(self, *, cancel_stale: bool | None = None) -> ReconcileReport:
         should_cancel = self.settings.cancel_stale_orders if cancel_stale is None else cancel_stale
@@ -43,7 +49,8 @@ class OrderReconciler:
             if order.get("status") not in OPEN_ORDER_STATUSES:
                 kept += 1
                 continue
-            if order.get("currency") not in (None, "KRW"):
+            currency = order.get("currency")
+            if currency is not None and currency not in self.allowed_currencies:
                 kept += 1
                 continue
             ordered_at = _parse_ordered_at(order.get("orderedAt"))

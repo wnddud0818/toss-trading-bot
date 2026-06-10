@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import math
 from datetime import date
 from decimal import Decimal
 from statistics import pstdev
 
-from .config import StrategySettings
+from .config import CostSettings, StrategySettings
 from .models import Candle, OrderSide, OrderType, Position, RankedCandidate, Signal, UniverseCandidate
 from .utils import dec, money, qty
 
 
 class HybridMomentumStrategy:
-    def __init__(self, settings: StrategySettings):
+    def __init__(self, settings: StrategySettings, costs: CostSettings | None = None):
         self.settings = settings
+        self.costs = costs or CostSettings.zero()
+
+    @property
+    def round_trip_cost(self) -> Decimal:
+        """매수+매도 수수료, 매도 세금/수수료, 양방향 슬리피지를 합친 왕복 비용 비율."""
+        return (
+            dec(self.costs.commission_rate) * 2
+            + dec(self.costs.sell_fee_rate)
+            + dec(self.costs.slippage_bps) / Decimal("10000") * 2
+        )
 
     def rank_candidates(
         self,
@@ -61,6 +72,11 @@ class HybridMomentumStrategy:
         budget: Decimal,
     ) -> Signal | None:
         if len(daily_candles) < 2 or len(intraday_candles) < self.settings.intraday_box_minutes + 1:
+            return None
+        # 비용 허들: 보유기간 동안 기대할 수 있는 변동(일변동성×√보유일)이
+        # 왕복비용×배수를 넘지 못하면 수수료를 회수할 가능성이 낮으므로 진입하지 않는다.
+        expected_move = candidate.volatility * dec(math.sqrt(self.settings.max_holding_days))
+        if expected_move < self.round_trip_cost * dec(self.settings.min_edge_multiple):
             return None
         daily_sorted = sorted(daily_candles, key=lambda candle: candle.timestamp)
         intraday_sorted = sorted(intraday_candles, key=lambda candle: candle.timestamp)
@@ -119,7 +135,9 @@ class HybridMomentumStrategy:
         trailing_stop = high_watermark * (Decimal("1") - trailing_pct)
         breakeven_stop = None
         if profit_from_entry >= dec(self.settings.breakeven_trigger_pct):
-            breakeven_stop = position.entry_price * (Decimal("1") + dec(self.settings.breakeven_buffer_pct))
+            # 본전 보호는 왕복 비용까지 덮어야 실제로 본전이다.
+            buffer = max(dec(self.settings.breakeven_buffer_pct), self.round_trip_cost)
+            breakeven_stop = position.entry_price * (Decimal("1") + buffer)
         open_price = intraday_sorted[0].open
         daily_drop = latest.close <= open_price * (Decimal("1") - dec(self.settings.daily_drop_exit_pct))
         held_days = (today - position.entry_date).days

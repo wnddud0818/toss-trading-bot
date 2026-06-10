@@ -5,94 +5,127 @@ reports_dir: reports
 
 paper:
   initial_cash_krw: 10000000
+  initial_cash_usd: 7000
 
 toss:
   base_url: https://openapi.tossinvest.com
   token_refresh_margin_seconds: 60
   timeout_seconds: 10
 
-universe:
-  markets: [KOSPI, KOSDAQ]
-  liquidity_top_n: 200
-  watch_top_n: 60
-  min_trading_value_krw: 3000000000
-  include_etf: false
-  excluded_warning_types:
-    - LIQUIDATION_TRADING
-    - OVERHEATED
-    - INVESTMENT_WARNING
-    - INVESTMENT_RISK
-    - VI_STATIC
-    - VI_DYNAMIC
-    - VI_STATIC_AND_DYNAMIC
-    - STOCK_WARRANTS
+fx:
+  fallback_usd_krw: 1400.0
+  refresh_minutes: 10
 
-strategy:
-  max_positions: 8
-  momentum_windows: [20, 60, 120]
-  momentum_weights: [0.50, 0.30, 0.20]
-  volatility_window: 20
-  trend_quality_weight: 0.20
-  volume_accumulation_weight: 0.10
-  high_proximity_weight: 0.10
-  liquidity_weight: 0.10
-  min_score: 0.5
-  min_20d_return_pct: 0.03
-  min_60d_return_pct: 0.05
-  max_5d_return_pct: 0.25
-  max_drawdown_from_high_pct: 0.30
-  min_volume_accumulation_ratio: 0.85
-  max_distance_from_ma20_pct: 0.18
-  max_gap_up_pct: 0.07
-  max_intraday_extension_pct: 0.08
-  breakout_buffer_pct: 0.001
-  require_trend_alignment: true
-  require_vwap_confirmation: true
-  volume_spike_multiplier: 1.5
-  intraday_box_minutes: 20
-  stop_loss_pct: 0.04
-  trailing_stop_pct: 0.03
-  breakeven_trigger_pct: 0.025
-  breakeven_buffer_pct: 0.003
-  profit_lock_trigger_pct: 0.08
-  profit_lock_trailing_stop_pct: 0.02
-  daily_drop_exit_pct: 0.035
-  max_holding_days: 10
-  new_entries_cutoff: "15:20"
-  forced_exit_window_start: "15:25"
-  forced_exit_window_end: "15:30"
+markets:
+  KR:
+    enabled: true
+    universe:
+      segments: [KOSPI, KOSDAQ]
+      liquidity_top_n: 200
+      watch_top_n: 60
+      min_trading_value: 3000000000   # KRW 일 거래대금
+      include_etf: false
+      excluded_warning_types:
+        - LIQUIDATION_TRADING
+        - OVERHEATED
+        - INVESTMENT_WARNING
+        - INVESTMENT_RISK
+        - VI_STATIC
+        - VI_DYNAMIC
+        - VI_STATIC_AND_DYNAMIC
+        - STOCK_WARRANTS
+    strategy:
+      max_positions: 8
+      momentum_windows: [20, 60, 120]
+      momentum_weights: [0.50, 0.30, 0.20]
+      volatility_window: 20
+      min_score: 0.5
+      stop_loss_pct: 0.04
+      trailing_stop_pct: 0.03
+      breakeven_trigger_pct: 0.025
+      breakeven_buffer_pct: 0.003
+      profit_lock_trigger_pct: 0.08
+      profit_lock_trailing_stop_pct: 0.02
+      daily_drop_exit_pct: 0.035
+      max_holding_days: 10
+      min_edge_multiple: 3.0
+      reentry_cooldown_days: 1
+      entry_cutoff_minutes: 10
+    execution:
+      max_entry_spread_bps: 25
+      max_exit_spread_bps: 80
+      max_chase_bps: 20
+      max_orderbook_participation: 0.25
+      price_limit_buffer_pct: 0.01
+      stale_order_minutes: 3
+      cancel_stale_orders: true
+    costs:
+      commission_rate: 0.00015      # 토스증권 국내 수수료
+      sell_fee_rate: 0.002          # 거래세 + 농특세
+      slippage_bps: 8
+      min_order_amount: 50000       # KRW
+
+  US:
+    enabled: true
+    universe:
+      segments: [NYSE, NASDAQ, AMEX]
+      watch_top_n: 30
+      min_trading_value: 50000000   # USD 일 거래대금 (20일 평균)
+      include_etf: false
+      use_sp500_listing: false      # true면 FDR S&P500 목록을 후보군에 추가
+      pool_cap: 150
+      # candidate_symbols 미지정 시 내장 대형주 80종목 사용
+    strategy:
+      # 미국은 수수료가 비싸므로 저회전 프로필: 더 적은 종목, 더 긴 보유,
+      # 더 넓은 스탑, 비용 허들 강화로 회전당 기대수익이 비용을 넘도록 한다.
+      max_positions: 4
+      min_20d_return_pct: 0.04
+      min_60d_return_pct: 0.08
+      max_5d_return_pct: 0.30
+      max_drawdown_from_high_pct: 0.25
+      max_distance_from_ma20_pct: 0.15
+      max_gap_up_pct: 0.05
+      max_intraday_extension_pct: 0.06
+      volume_spike_multiplier: 1.8
+      stop_loss_pct: 0.06
+      trailing_stop_pct: 0.05
+      breakeven_trigger_pct: 0.04
+      breakeven_buffer_pct: 0.004
+      profit_lock_trigger_pct: 0.12
+      profit_lock_trailing_stop_pct: 0.03
+      daily_drop_exit_pct: 0.045
+      max_holding_days: 25
+      min_edge_multiple: 5.0
+      reentry_cooldown_days: 5
+      entry_cutoff_minutes: 30
+    execution:
+      max_entry_spread_bps: 15
+      max_exit_spread_bps: 50
+      max_chase_bps: 10
+      max_orderbook_participation: 0.25
+      stale_order_minutes: 3
+      cancel_stale_orders: true
+    costs:
+      commission_rate: 0.0025       # 토스증권 해외 기본 수수료 0.25% (이벤트 우대 시 낮춰서 설정)
+      sell_fee_rate: 0.00005        # SEC fee + FINRA TAF 근사치 (매도 시)
+      slippage_bps: 5
+      min_order_amount: 500         # USD
 
 risk:
   max_symbol_weight: 0.18
   min_cash_weight: 0.10
   target_position_volatility_pct: 0.025
   max_entry_risk_pct: 0.008
-  min_order_amount_krw: 50000
   daily_loss_limit_pct: 0.03
   weekly_loss_limit_pct: 0.08
   max_drawdown_pct: 0.15
   max_live_order_amount_krw: 1000000
   min_paper_trading_days: 20
   paper_trading_days_completed: 0
-  commission_rate: 0.00015
-  transaction_tax_rate: 0.002
-  slippage_bps: 8
-
-execution:
-  max_entry_spread_bps: 25
-  max_exit_spread_bps: 80
-  max_chase_bps: 20
-  max_orderbook_participation: 0.25
-  price_limit_buffer_pct: 0.01
-  stale_order_minutes: 3
-  cancel_stale_orders: true
 
 schedule:
   preflight_time: "08:30"
   premarket_report_time: "08:50"
-  market_loop_start: "09:00"
-  market_loop_end: "15:20"
-  close_policy_start: "15:25"
-  close_policy_end: "15:30"
+  us_universe_refresh_time: "21:30"
   reconcile_interval_minutes: 5
   report_time: "15:40"

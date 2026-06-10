@@ -7,9 +7,9 @@ from typing import Iterable
 
 from .config import UniverseSettings
 from .db import BotRepository
-from .models import UniverseCandidate
+from .models import MarketCountry, UniverseCandidate
 from .toss_client import TossClient
-from .utils import dec, extract_items, quiet_external_data_source
+from .utils import dec, extract_items, parse_toss_candle, quiet_external_data_source
 
 logger = logging.getLogger(__name__)
 
@@ -20,24 +20,34 @@ class UniverseBuilder:
         settings: UniverseSettings,
         repository: BotRepository,
         toss_client: TossClient | None = None,
+        market: MarketCountry = MarketCountry.KR,
     ):
         self.settings = settings
         self.repository = repository
         self.toss_client = toss_client
+        self.market = market
 
     def refresh(self, as_of: date) -> list[UniverseCandidate]:
         try:
-            candidates = self._load_from_krx(as_of)
+            if self.market == MarketCountry.KR:
+                candidates = self._refresh_kr(as_of)
+            else:
+                candidates = self._refresh_us()
         except Exception:
-            logger.exception("KRX universe refresh failed; falling back to latest cached universe")
-            cached = self.repository.load_latest_universe()
+            logger.exception("%s universe refresh failed; falling back to latest cached universe", self.market)
+            cached = self.repository.load_latest_universe(self.market)
             if cached:
                 return cached
             raise
-        candidates = self._filter_by_liquidity(candidates)
-        candidates = self._verify_with_toss(candidates[: self.settings.watch_top_n])
-        self.repository.save_universe(as_of, candidates)
+        self.repository.save_universe(as_of, candidates, self.market)
         return candidates
+
+    # --- KR -----------------------------------------------------------------
+
+    def _refresh_kr(self, as_of: date) -> list[UniverseCandidate]:
+        candidates = self._load_from_krx(as_of)
+        candidates = self._filter_by_liquidity(candidates)
+        return self._verify_kr_with_toss(candidates[: self.settings.watch_top_n])
 
     def _load_from_krx(self, as_of: date) -> list[UniverseCandidate]:
         try:
@@ -52,7 +62,7 @@ class UniverseBuilder:
         date_text = as_of.strftime("%Y%m%d")
         rows: list[UniverseCandidate] = []
         with quiet_external_data_source():
-            for market in self.settings.markets:
+            for market in self.settings.segments:
                 tickers = stock.get_market_ticker_list(date_text, market=market)
                 ohlcv = stock.get_market_ohlcv(date_text, market=market)
                 if ohlcv.empty:
@@ -92,7 +102,7 @@ class UniverseBuilder:
         rows: list[UniverseCandidate] = []
         for _, row in listing.iterrows():
             market = str(row.get(market_column, ""))
-            if market not in self.settings.markets:
+            if market not in self.settings.segments:
                 continue
             symbol = str(row.get("Code", "")).zfill(6)
             close_value = row.get("Close", 0)
@@ -121,11 +131,11 @@ class UniverseBuilder:
         filtered = [
             candidate
             for candidate in candidates
-            if candidate.trading_value >= Decimal(self.settings.min_trading_value_krw)
+            if candidate.trading_value >= Decimal(str(self.settings.min_trading_value))
         ]
         return sorted(filtered, key=lambda item: item.trading_value, reverse=True)[: self.settings.liquidity_top_n]
 
-    def _verify_with_toss(self, candidates: list[UniverseCandidate]) -> list[UniverseCandidate]:
+    def _verify_kr_with_toss(self, candidates: list[UniverseCandidate]) -> list[UniverseCandidate]:
         if self.toss_client is None:
             return candidates
         allowed = {candidate.symbol: candidate for candidate in candidates}
@@ -155,6 +165,88 @@ class UniverseBuilder:
                 continue
             safe.append(allowed[symbol])
         return sorted(safe, key=lambda item: item.trading_value, reverse=True)
+
+    # --- US -----------------------------------------------------------------
+
+    def _refresh_us(self) -> list[UniverseCandidate]:
+        if self.toss_client is None:
+            raise RuntimeError("US universe requires a Toss client")
+        pool = self._us_symbol_pool()
+        if not pool:
+            raise RuntimeError("US universe pool is empty")
+        verified = self._verify_us_with_toss(pool)
+        candidates: list[UniverseCandidate] = []
+        for symbol, stock_info in verified.items():
+            try:
+                candidate = self._us_candidate_from_candles(symbol, stock_info)
+            except Exception:
+                logger.warning("Skipping US candidate %s: candle fetch failed", symbol, exc_info=True)
+                continue
+            if candidate is not None:
+                candidates.append(candidate)
+        if not candidates:
+            raise RuntimeError("US universe verification returned no candidates")
+        return sorted(candidates, key=lambda item: item.trading_value, reverse=True)[: self.settings.watch_top_n]
+
+    def _us_symbol_pool(self) -> list[str]:
+        symbols = list(self.settings.candidate_symbols)
+        if self.settings.use_sp500_listing:
+            try:
+                import FinanceDataReader as fdr
+
+                with quiet_external_data_source():
+                    listing = fdr.StockListing("S&P500")
+                column = "Symbol" if "Symbol" in listing.columns else "Code"
+                symbols.extend(str(value) for value in listing[column].tolist())
+            except Exception:
+                logger.warning("S&P500 listing fetch failed; using configured candidate symbols", exc_info=True)
+        seen: set[str] = set()
+        unique: list[str] = []
+        for symbol in symbols:
+            normalized = symbol.strip().upper()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique.append(normalized)
+        return unique[: self.settings.pool_cap]
+
+    def _verify_us_with_toss(self, pool: list[str]) -> dict[str, dict]:
+        allowed_types = {"FOREIGN_STOCK"}
+        if self.settings.include_etf:
+            allowed_types.add("FOREIGN_ETF")
+        verified: dict[str, dict] = {}
+        for batch in _chunks(pool, 200):
+            for stock_info in extract_items(self.toss_client.get_stocks(batch), "stocks", "items"):
+                symbol = stock_info.get("symbol")
+                if symbol not in pool or stock_info.get("status") != "ACTIVE":
+                    continue
+                if stock_info.get("currency") != "USD":
+                    continue
+                if stock_info.get("securityType") not in allowed_types:
+                    continue
+                if stock_info.get("securityType") == "FOREIGN_STOCK" and not stock_info.get("isCommonShare", True):
+                    continue
+                verified[symbol] = stock_info
+        return verified
+
+    def _us_candidate_from_candles(self, symbol: str, stock_info: dict) -> UniverseCandidate | None:
+        result = self.toss_client.get_candles(symbol, "1d", 25)
+        candles = [parse_toss_candle(item) for item in extract_items(result, "candles")]
+        candles.sort(key=lambda candle: candle.timestamp)
+        if len(candles) < 20:
+            return None
+        recent = candles[-20:]
+        dollar_volume = sum(candle.close * candle.volume for candle in recent) / Decimal(len(recent))
+        if dollar_volume < Decimal(str(self.settings.min_trading_value)):
+            return None
+        latest = candles[-1]
+        return UniverseCandidate(
+            symbol=symbol,
+            name=stock_info.get("englishName") or stock_info.get("name") or symbol,
+            market=stock_info.get("market", "US_ETC"),
+            trading_value=dollar_volume,
+            close=latest.close,
+            volume=latest.volume,
+        )
 
 
 def _chunks(values: list[str], size: int):

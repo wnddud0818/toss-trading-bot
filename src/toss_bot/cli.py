@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     backtest = subparsers.add_parser("backtest")
     backtest.add_argument("--from", dest="from_date", required=True)
     backtest.add_argument("--to", dest="to_date", required=True)
+    backtest.add_argument("--market", choices=["KR", "US"], default="KR")
 
     run = subparsers.add_parser("run")
     run.add_argument("--mode", choices=[RunMode.PAPER.value, RunMode.LIVE.value], default=RunMode.PAPER.value)
@@ -61,10 +62,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "resume":
         return _resume(repository, reset_peak=args.reset_peak)
     if args.command == "backtest":
-        result = Backtester(settings).run(date.fromisoformat(args.from_date), date.fromisoformat(args.to_date))
+        result = Backtester(settings).run(
+            date.fromisoformat(args.from_date), date.fromisoformat(args.to_date), market=args.market
+        )
         print(
-            f"Backtest {result.start}..{result.end}: "
-            f"{result.start_equity} -> {result.end_equity} "
+            f"Backtest [{args.market}] {result.start}..{result.end}: "
+            f"{result.start_equity} -> {result.end_equity} {result.currency} "
             f"return={result.total_return:.4%} trades={result.trades} method={result.method}"
         )
         if result.warning:
@@ -93,9 +96,10 @@ def main(argv: list[str] | None = None) -> int:
         bot = TradingBot(settings, repository, toss_client, DiscordNotifier(settings))
         if args.once:
             bot.preflight()
-            bot.refresh_universe()
-            bot.premarket_report()
-            bot.market_loop_once()
+            for market in settings.enabled_markets():
+                bot.refresh_universe(market)
+                bot.premarket_report(market)
+                bot.market_loop_once(market)
             return 0
         start_scheduler(settings, bot)
         return 0
@@ -114,9 +118,10 @@ def _status(settings, repository: BotRepository) -> int:
     )
     print(f"Halted: {state.halted_reason or 'no'}")
     if settings.mode == RunMode.PAPER:
-        cash = repository.get_cash(Decimal(settings.paper.initial_cash_krw))
+        cash_krw = repository.get_cash("KRW", Decimal(settings.paper.initial_cash_krw))
+        cash_usd = repository.get_cash("USD", Decimal(settings.paper.initial_cash_usd))
         positions = repository.list_positions()
-        print(f"Paper cash: {cash}")
+        print(f"Paper cash: {cash_krw} KRW, {cash_usd} USD")
         print(f"Paper positions: {len(positions)}")
         for position in positions:
             print(
@@ -179,13 +184,19 @@ def _doctor(settings) -> int:
         token = client.token()
         accounts = client.get_accounts()
         print(f"Toss auth ok token_prefix={token[:8]} accounts={len(accounts)}")
-        calendar = client.get_kr_market_calendar()
-        today = calendar.get("today", {})
-        print(f"KR market calendar today={today.get('date', 'unknown')}")
+        enabled = [str(market) for market in settings.enabled_markets()]
+        for market in enabled:
+            calendar = client.get_market_calendar(market)
+            today = calendar.get("today", {})
+            print(f"{market} market calendar today={today.get('date', 'unknown')}")
+        if "US" in enabled:
+            rate = client.get_exchange_rate("USD", "KRW")
+            print(f"USD/KRW mid rate: {rate.get('midRate', 'unknown')}")
         commissions = client.get_commissions()
-        kr_commissions = [item for item in commissions if item.get("marketCountry") == "KR"]
-        if kr_commissions:
-            print(f"KR commission configured: {kr_commissions[0].get('commissionRate')}")
+        for market in enabled:
+            matched = [item for item in commissions if item.get("marketCountry") == market]
+            if matched:
+                print(f"{market} commission configured: {matched[0].get('commissionRate')}")
     except TossApiError as exc:
         print(f"Toss check failed: {exc}")
         return 1

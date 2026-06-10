@@ -6,8 +6,8 @@ from decimal import Decimal, ROUND_DOWN
 
 import pandas as pd
 
-from .config import Settings
-from .models import Candle, UniverseCandidate
+from .config import CostSettings, Settings, StrategySettings
+from .models import Candle, MarketCountry, UniverseCandidate
 from .strategy import HybridMomentumStrategy
 from .utils import dec, money, quiet_external_data_source
 
@@ -21,6 +21,7 @@ class BacktestResult:
     total_return: Decimal
     trades: int
     method: str
+    currency: str = "KRW"
     warning: str | None = None
 
 
@@ -28,45 +29,129 @@ class Backtester:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    def run(self, start: date, end: date) -> BacktestResult:
+    def run(self, start: date, end: date, market: MarketCountry | str = MarketCountry.KR) -> BacktestResult:
+        market = MarketCountry(market)
+        profile = self.settings.market_profile(market)
         errors: list[str] = []
-        try:
-            with quiet_external_data_source():
-                return self._run_krx_rotation(start, end)
-        except Exception as exc:
-            errors.append(f"KRX: {exc}")
+        if market == MarketCountry.KR:
+            loaders = [("KRX", self._load_kr_closes_krx), ("FinanceDataReader", self._load_kr_closes_fdr)]
+            initial = Decimal(self.settings.paper.initial_cash_krw)
+            currency = "KRW"
+        else:
+            loaders = [("FinanceDataReader", self._load_us_closes_fdr)]
+            initial = Decimal(self.settings.paper.initial_cash_usd)
+            currency = "USD"
+        for name, loader in loaders:
             try:
                 with quiet_external_data_source():
-                    return self._run_fdr_rotation(start, end)
+                    closes = loader(start, end)
+                return self._rotation_backtest(
+                    closes, start, end, profile.strategy, profile.costs, initial, currency
+                )
             except Exception as exc:
-                errors.append(f"FinanceDataReader: {exc}")
-                return self._fallback_cost_smoke(start, end, "; ".join(errors))
+                errors.append(f"{name}: {exc}")
+        return self._fallback_cost_smoke(start, end, profile.costs, initial, currency, "; ".join(errors))
 
-    def _run_krx_rotation(self, start: date, end: date) -> BacktestResult:
+    # --- 데이터 로더 ---------------------------------------------------------
+
+    def _load_kr_closes_krx(self, start: date, end: date) -> pd.DataFrame:
         from pykrx import stock
 
+        profile = self.settings.market_profile(MarketCountry.KR)
         lookback_start = start - timedelta(days=260)
-        symbols = self._top_liquidity_symbols(stock, end)
+        symbols: list[str] = []
+        date_text = end.strftime("%Y%m%d")
+        for segment in profile.universe.segments:
+            frame = stock.get_market_ohlcv(date_text, market=segment)
+            if frame.empty:
+                continue
+            filtered = frame[frame["거래대금"] >= profile.universe.min_trading_value]
+            top = filtered.sort_values("거래대금", ascending=False).head(profile.universe.watch_top_n)
+            symbols.extend(str(symbol) for symbol in top.index)
+        symbols = symbols[: profile.universe.watch_top_n]
         if not symbols:
             raise RuntimeError("No KRX symbols for backtest")
-        closes = self._load_close_frame(stock, symbols, lookback_start, end)
+        series = {}
+        for symbol in symbols:
+            frame = stock.get_market_ohlcv_by_date(
+                lookback_start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), symbol
+            )
+            if frame.empty or "종가" not in frame:
+                continue
+            series[symbol] = frame["종가"]
+        if not series:
+            raise RuntimeError("No close history for backtest")
+        return pd.DataFrame(series)
+
+    def _load_kr_closes_fdr(self, start: date, end: date) -> pd.DataFrame:
+        import FinanceDataReader as fdr
+
+        profile = self.settings.market_profile(MarketCountry.KR)
+        listing = fdr.StockListing("KRX")
+        if listing.empty:
+            raise RuntimeError("FinanceDataReader returned no KRX listing")
+        market_column = "Market" if "Market" in listing.columns else "MarketId"
+        listing = listing[listing[market_column].isin(profile.universe.segments)]
+        if "Amount" in listing.columns:
+            listing = listing.sort_values("Amount", ascending=False)
+        symbols = [str(code).zfill(6) for code in listing["Code"].head(profile.universe.watch_top_n)]
+        return self._load_fdr_frame(fdr, symbols, start - timedelta(days=260), end)
+
+    def _load_us_closes_fdr(self, start: date, end: date) -> pd.DataFrame:
+        import FinanceDataReader as fdr
+
+        profile = self.settings.market_profile(MarketCountry.US)
+        symbols = [
+            symbol.replace(".", "-")  # FDR(야후 계열)은 BRK.B 대신 BRK-B 표기를 쓴다
+            for symbol in profile.universe.candidate_symbols[: profile.universe.watch_top_n * 2]
+        ]
+        if not symbols:
+            raise RuntimeError("No US candidate symbols configured for backtest")
+        return self._load_fdr_frame(fdr, symbols, start - timedelta(days=260), end)
+
+    def _load_fdr_frame(self, fdr, symbols: list[str], start: date, end: date) -> pd.DataFrame:
+        series = {}
+        for symbol in symbols:
+            try:
+                frame = fdr.DataReader(symbol, start.isoformat(), end.isoformat())
+            except Exception:
+                continue
+            if frame.empty or "Close" not in frame:
+                continue
+            series[symbol] = frame["Close"]
+        if not series:
+            raise RuntimeError("No FinanceDataReader close history for backtest")
+        return pd.DataFrame(series)
+
+    # --- 시뮬레이션 ----------------------------------------------------------
+
+    def _rotation_backtest(
+        self,
+        closes: pd.DataFrame,
+        start: date,
+        end: date,
+        strategy_settings: StrategySettings,
+        costs: CostSettings,
+        initial: Decimal,
+        currency: str,
+    ) -> BacktestResult:
         closes = closes.dropna(axis=1, thresh=140).ffill()
         trading_days = [day.date() for day in closes.index if start <= day.date() <= end]
         if not trading_days:
             raise RuntimeError("No trading days for backtest")
 
-        cash = Decimal(self.settings.paper.initial_cash_krw)
+        cash = initial
         holdings: dict[str, Decimal] = {}
         trades = 0
-        max_window = max(self.settings.strategy.momentum_windows)
+        max_window = max(strategy_settings.momentum_windows)
 
         for idx, day in enumerate(trading_days):
             timestamp = pd.Timestamp(day)
             if idx < max_window or (timestamp.weekday() != 0 and idx != max_window):
                 continue
             prices = closes.loc[:timestamp].tail(max_window + 1)
-            ranked = self._rank_from_close_frame(prices)
-            selected = ranked[: self.settings.strategy.max_positions]
+            ranked = self._rank_from_close_frame(prices, strategy_settings)
+            selected = ranked[: strategy_settings.max_positions]
             if not selected:
                 continue
             current_prices = closes.loc[timestamp]
@@ -75,7 +160,7 @@ class Backtester:
             for symbol in list(holdings):
                 if symbol not in selected:
                     price = dec(current_prices[symbol])
-                    cash += self._sell_value(holdings.pop(symbol), price)
+                    cash += self._sell_value(holdings.pop(symbol), price, costs)
                     trades += 1
 
             target_weight = min(
@@ -88,7 +173,7 @@ class Backtester:
                 if price <= 0 or symbol in holdings:
                     continue
                 quantity = (target_value / price).to_integral_value(rounding=ROUND_DOWN)
-                total_cost = self._buy_cost(quantity, price)
+                total_cost = self._buy_cost(quantity, price, costs)
                 if quantity > 0 and total_cost <= cash:
                     cash -= total_cost
                     holdings[symbol] = quantity
@@ -96,7 +181,6 @@ class Backtester:
 
         final_prices = closes.loc[pd.Timestamp(trading_days[-1])]
         end_equity = money(self._equity(cash, holdings, final_prices))
-        initial = Decimal(self.settings.paper.initial_cash_krw)
         return BacktestResult(
             start=start,
             end=end,
@@ -105,84 +189,22 @@ class Backtester:
             total_return=(end_equity / initial) - Decimal("1"),
             trades=trades,
             method="daily_proxy_with_live_ranking",
-            warning="Proxy backtest: intraday breakout, orderbook execution, stops, and closing policy are not simulated.",
+            currency=currency,
+            warning="Proxy backtest: intraday breakout, orderbook execution, stops, and session policy are not simulated.",
         )
 
-    def _run_fdr_rotation(self, start: date, end: date) -> BacktestResult:
-        import FinanceDataReader as fdr
-
-        listing = fdr.StockListing("KRX")
-        if listing.empty:
-            raise RuntimeError("FinanceDataReader returned no KRX listing")
-        market_column = "Market" if "Market" in listing.columns else "MarketId"
-        listing = listing[listing[market_column].isin(self.settings.universe.markets)]
-        if "Amount" in listing.columns:
-            listing = listing.sort_values("Amount", ascending=False)
-        symbols = [str(code).zfill(6) for code in listing["Code"].head(self.settings.universe.watch_top_n)]
-        closes = self._load_close_frame_from_fdr(fdr, symbols, start - timedelta(days=260), end)
-        closes = closes.dropna(axis=1, thresh=140).ffill()
-        trading_days = [day.date() for day in closes.index if start <= day.date() <= end]
-        if not trading_days:
-            raise RuntimeError("No trading days for FinanceDataReader backtest")
-
-        cash = Decimal(self.settings.paper.initial_cash_krw)
-        holdings: dict[str, Decimal] = {}
-        trades = 0
-        max_window = max(self.settings.strategy.momentum_windows)
-
-        for idx, day in enumerate(trading_days):
-            timestamp = pd.Timestamp(day)
-            if idx < max_window or (timestamp.weekday() != 0 and idx != max_window):
-                continue
-            prices = closes.loc[:timestamp].tail(max_window + 1)
-            ranked = self._rank_from_close_frame(prices)
-            selected = ranked[: self.settings.strategy.max_positions]
-            if not selected:
-                continue
-            current_prices = closes.loc[timestamp]
-            equity = self._equity(cash, holdings, current_prices)
-
-            for symbol in list(holdings):
-                if symbol not in selected:
-                    price = dec(current_prices[symbol])
-                    cash += self._sell_value(holdings.pop(symbol), price)
-                    trades += 1
-
-            target_weight = min(
-                dec(self.settings.risk.max_symbol_weight),
-                (Decimal("1") - dec(self.settings.risk.min_cash_weight)) / Decimal(len(selected)),
-            )
-            target_value = equity * target_weight
-            for symbol in selected:
-                price = dec(current_prices[symbol])
-                if price <= 0 or symbol in holdings:
-                    continue
-                quantity = (target_value / price).to_integral_value(rounding=ROUND_DOWN)
-                total_cost = self._buy_cost(quantity, price)
-                if quantity > 0 and total_cost <= cash:
-                    cash -= total_cost
-                    holdings[symbol] = quantity
-                    trades += 1
-
-        final_prices = closes.loc[pd.Timestamp(trading_days[-1])]
-        end_equity = money(self._equity(cash, holdings, final_prices))
-        initial = Decimal(self.settings.paper.initial_cash_krw)
-        return BacktestResult(
-            start=start,
-            end=end,
-            start_equity=initial,
-            end_equity=end_equity,
-            total_return=(end_equity / initial) - Decimal("1"),
-            trades=trades,
-            method="daily_proxy_with_live_ranking",
-            warning="Proxy backtest: intraday breakout, orderbook execution, stops, and closing policy are not simulated.",
-        )
-
-    def _fallback_cost_smoke(self, start: date, end: date, error_summary: str = "") -> BacktestResult:
-        initial = Decimal(self.settings.paper.initial_cash_krw)
-        round_trip_cost = dec(self.settings.risk.commission_rate) * Decimal("2")
-        round_trip_cost += dec(self.settings.risk.transaction_tax_rate)
-        round_trip_cost += (dec(self.settings.risk.slippage_bps) / Decimal("10000")) * Decimal("2")
+    def _fallback_cost_smoke(
+        self,
+        start: date,
+        end: date,
+        costs: CostSettings,
+        initial: Decimal,
+        currency: str,
+        error_summary: str = "",
+    ) -> BacktestResult:
+        round_trip_cost = dec(costs.commission_rate) * Decimal("2")
+        round_trip_cost += dec(costs.sell_fee_rate)
+        round_trip_cost += (dec(costs.slippage_bps) / Decimal("10000")) * Decimal("2")
         conservative_drag = initial * round_trip_cost
         end_equity = money(initial - conservative_drag)
         return BacktestResult(
@@ -193,52 +215,17 @@ class Backtester:
             total_return=(end_equity / initial) - Decimal("1"),
             trades=2,
             method="cost_smoke",
+            currency=currency,
             warning=f"Historical data backtest unavailable; returned cost-only smoke result. {error_summary}".strip(),
         )
 
-    def _top_liquidity_symbols(self, stock, as_of: date) -> list[str]:
-        symbols: list[str] = []
-        date_text = as_of.strftime("%Y%m%d")
-        for market in self.settings.universe.markets:
-            frame = stock.get_market_ohlcv(date_text, market=market)
-            if frame.empty:
-                continue
-            filtered = frame[frame["거래대금"] >= self.settings.universe.min_trading_value_krw]
-            top = filtered.sort_values("거래대금", ascending=False).head(self.settings.universe.watch_top_n)
-            symbols.extend(str(symbol) for symbol in top.index)
-        return symbols[: self.settings.universe.watch_top_n]
-
-    def _load_close_frame(self, stock, symbols: list[str], start: date, end: date) -> pd.DataFrame:
-        start_text = start.strftime("%Y%m%d")
-        end_text = end.strftime("%Y%m%d")
-        series = {}
-        for symbol in symbols:
-            frame = stock.get_market_ohlcv_by_date(start_text, end_text, symbol)
-            if frame.empty or "종가" not in frame:
-                continue
-            series[symbol] = frame["종가"]
-        if not series:
-            raise RuntimeError("No close history for backtest")
-        return pd.DataFrame(series)
-
-    def _load_close_frame_from_fdr(self, fdr, symbols: list[str], start: date, end: date) -> pd.DataFrame:
-        series = {}
-        for symbol in symbols:
-            frame = fdr.DataReader(symbol, start.isoformat(), end.isoformat())
-            if frame.empty or "Close" not in frame:
-                continue
-            series[symbol] = frame["Close"]
-        if not series:
-            raise RuntimeError("No FinanceDataReader close history for backtest")
-        return pd.DataFrame(series)
-
-    def _rank_from_close_frame(self, closes: pd.DataFrame) -> list[str]:
-        strategy = HybridMomentumStrategy(self.settings.strategy)
+    def _rank_from_close_frame(self, closes: pd.DataFrame, strategy_settings: StrategySettings) -> list[str]:
+        strategy = HybridMomentumStrategy(strategy_settings)
         universe: list[UniverseCandidate] = []
         daily: dict[str, list[Candle]] = {}
         for symbol in closes.columns:
             values = closes[symbol].dropna()
-            if len(values) < max(self.settings.strategy.momentum_windows) + 1:
+            if len(values) < max(strategy_settings.momentum_windows) + 1:
                 continue
             candles: list[Candle] = []
             for timestamp, raw_price in values.items():
@@ -246,7 +233,7 @@ class Backtester:
                 if price <= 0:
                     continue
                 candles.append(Candle(pd.Timestamp(timestamp).to_pydatetime(), price, price, price, price, Decimal("1")))
-            if len(candles) < max(self.settings.strategy.momentum_windows) + 1:
+            if len(candles) < max(strategy_settings.momentum_windows) + 1:
                 continue
             daily[symbol] = candles
             universe.append(
@@ -267,16 +254,16 @@ class Backtester:
             equity += quantity * dec(prices[symbol])
         return equity
 
-    def _buy_cost(self, quantity: Decimal, price: Decimal) -> Decimal:
-        gross = quantity * self._slipped(price, buy=True)
-        return gross + gross * dec(self.settings.risk.commission_rate)
+    def _buy_cost(self, quantity: Decimal, price: Decimal, costs: CostSettings) -> Decimal:
+        gross = quantity * self._slipped(price, costs, buy=True)
+        return gross + gross * dec(costs.commission_rate)
 
-    def _sell_value(self, quantity: Decimal, price: Decimal) -> Decimal:
-        gross = quantity * self._slipped(price, buy=False)
-        commission = gross * dec(self.settings.risk.commission_rate)
-        tax = gross * dec(self.settings.risk.transaction_tax_rate)
-        return gross - commission - tax
+    def _sell_value(self, quantity: Decimal, price: Decimal, costs: CostSettings) -> Decimal:
+        gross = quantity * self._slipped(price, costs, buy=False)
+        commission = gross * dec(costs.commission_rate)
+        fee = gross * dec(costs.sell_fee_rate)
+        return gross - commission - fee
 
-    def _slipped(self, price: Decimal, buy: bool) -> Decimal:
-        slip = dec(self.settings.risk.slippage_bps) / Decimal("10000")
+    def _slipped(self, price: Decimal, costs: CostSettings, buy: bool) -> Decimal:
+        slip = dec(costs.slippage_bps) / Decimal("10000")
         return price * (Decimal("1") + slip if buy else Decimal("1") - slip)

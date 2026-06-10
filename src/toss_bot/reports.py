@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .config import Settings
 from .db import BotRepository
-from .utils import money
+from .markets import currency_for, market_for_symbol, round_money
+from .models import Currency
 
 
 class ReportWriter:
@@ -23,15 +24,24 @@ class ReportWriter:
         matching = [trade for trade in trades if trade.ts.date() == report_date]
         matching_orders = [order for order in orders if order.ts.date() == report_date]
         realized = self._realized_pnl(report_date)
-        total_pnl = sum((pnl for _, _, pnl, _ in realized), Decimal("0"))
+        totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        for _, symbol, pnl, _ in realized:
+            totals[currency_for(market_for_symbol(symbol)).value] += pnl
         wins = sum(1 for _, _, pnl, _ in realized if pnl > 0)
         losses = sum(1 for _, _, pnl, _ in realized if pnl < 0)
+        totals_text = (
+            ", ".join(
+                f"{round_money(amount, Currency(currency))} {currency}"
+                for currency, amount in sorted(totals.items())
+            )
+            or "0 KRW"
+        )
         lines = [
             f"# Daily Trading Report {report_date.isoformat()}",
             "",
             f"- Trades: {len(matching)}",
             f"- Orders: {len(matching_orders)}",
-            f"- Realized PnL: {money(total_pnl)} KRW (win {wins} / loss {losses})",
+            f"- Realized PnL: {totals_text} (win {wins} / loss {losses})",
             "",
         ]
         if realized:
@@ -39,12 +49,15 @@ class ReportWriter:
                 [
                     "## Realized PnL",
                     "",
-                    "| Mode | Symbol | Sells | Realized PnL |",
-                    "|---|---|---:|---:|",
+                    "| Mode | Symbol | Currency | Sells | Realized PnL |",
+                    "|---|---|---|---:|---:|",
                 ]
             )
             for mode, symbol, pnl, sell_count in realized:
-                lines.append(f"| {mode} | {symbol} | {sell_count} | {money(pnl)} |")
+                currency = currency_for(market_for_symbol(symbol))
+                lines.append(
+                    f"| {mode} | {symbol} | {currency.value} | {sell_count} | {round_money(pnl, currency)} |"
+                )
             lines.append("")
         lines.extend(
             [

@@ -67,3 +67,28 @@ def test_reconciler_handles_bare_list_payload(monkeypatch):
     assert report.open_orders == 2
     assert report.canceled_orders == 1
     assert toss.canceled == ["old-order"]
+
+
+def test_reconciler_keeps_orders_in_disallowed_currency(monkeypatch):
+    monkeypatch.setattr(order_reconcile, "now_kst", lambda: datetime(2026, 6, 10, 10, 0, tzinfo=KST))
+    toss = TossOrderStub()
+    orders = toss.get_open_orders()["orders"]
+    orders[0]["currency"] = "USD"
+
+    class UsOrderStub(TossOrderStub):
+        def get_open_orders(self):
+            return {"orders": orders}
+
+    us_toss = UsOrderStub()
+    reconciler = OrderReconciler(
+        ExecutionSettings(stale_order_minutes=3),
+        us_toss,
+        allowed_currencies={"KRW"},
+    )
+
+    report = reconciler.reconcile(cancel_stale=True)
+
+    assert report.open_orders == 2
+    assert report.canceled_orders == 0
+    assert report.kept_orders == 2
+    assert us_toss.canceled == []

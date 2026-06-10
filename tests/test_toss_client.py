@@ -77,6 +77,29 @@ def test_price_limit_wrapper_uses_toss_endpoint():
     assert ("/api/v1/price-limits", {"symbol": "000001"}) in seen
 
 
+def test_market_calendar_and_exchange_rate_wrappers_use_market_info_endpoints():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.url.params)))
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(200, json={"access_token": "token", "token_type": "Bearer", "expires_in": 3600})
+        if request.url.path == "/api/v1/exchange-rate":
+            return httpx.Response(200, json={"result": {"rate": "1400", "midRate": "1399"}})
+        return httpx.Response(200, json={"result": {"today": {"date": "2026-06-10"}}})
+
+    settings = Settings(toss_client_id="id", toss_client_secret="secret")
+    client = TossClient(settings, httpx.Client(transport=httpx.MockTransport(handler), base_url=settings.toss.base_url))
+
+    calendar = client.get_market_calendar("US")
+    rate = client.get_exchange_rate("USD", "KRW")
+
+    assert calendar["today"]["date"] == "2026-06-10"
+    assert rate["midRate"] == "1399"
+    assert ("/api/v1/market-calendar/US", {}) in seen
+    assert ("/api/v1/exchange-rate", {"baseCurrency": "USD", "quoteCurrency": "KRW"}) in seen
+
+
 def test_create_order_sends_day_time_in_force_and_account_header():
     seen = []
 

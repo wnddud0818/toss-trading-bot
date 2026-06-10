@@ -43,7 +43,7 @@ def test_daily_report_includes_realized_pnl(tmp_path):
     content = path.read_text(encoding="utf-8")
 
     assert "Realized PnL: 100 KRW (win 1 / loss 0)" in content
-    assert "| paper | 000001 | 1 | 100 |" in content
+    assert "| paper | 000001 | KRW | 1 | 100 |" in content
 
 
 def test_daily_report_ignores_pnl_realized_on_other_days(tmp_path):
@@ -79,3 +79,44 @@ def test_daily_report_ignores_pnl_realized_on_other_days(tmp_path):
     content = path.read_text(encoding="utf-8")
 
     assert "Realized PnL: 0 KRW (win 0 / loss 0)" in content
+
+
+def test_daily_report_splits_realized_pnl_by_currency(tmp_path):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'reports.sqlite3'}",
+        reports_dir=str(tmp_path / "reports"),
+    )
+    repository = BotRepository(init_db(settings.database_url))
+    for symbol, buy_price, sell_price in [
+        ("000001", Decimal("100"), Decimal("110")),
+        ("AAPL", Decimal("100"), Decimal("110")),
+    ]:
+        repository.record_trade(
+            ts=datetime(2026, 6, 9, 10, 0, tzinfo=KST),
+            mode="paper",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            price=buy_price,
+            commission=Decimal("0"),
+            tax=Decimal("0"),
+            reason="entry",
+        )
+        repository.record_trade(
+            ts=datetime(2026, 6, 10, 10, 0, tzinfo=KST),
+            mode="paper",
+            symbol=symbol,
+            side=OrderSide.SELL,
+            quantity=Decimal("10"),
+            price=sell_price,
+            commission=Decimal("0"),
+            tax=Decimal("0"),
+            reason="exit",
+        )
+
+    path = ReportWriter(settings, repository).write_daily_report(date(2026, 6, 10))
+    content = path.read_text(encoding="utf-8")
+
+    assert "Realized PnL: 100 KRW, 100.00 USD (win 2 / loss 0)" in content
+    assert "| paper | 000001 | KRW | 1 | 100 |" in content
+    assert "| paper | AAPL | USD | 1 | 100.00 |" in content

@@ -8,7 +8,8 @@ from typing import Iterable
 from sqlalchemy import Date, DateTime, Integer, Numeric, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from .models import OrderRequest, OrderResult, OrderSide, Position, UniverseCandidate
+from .markets import segments_for
+from .models import MarketCountry, OrderRequest, OrderResult, OrderSide, Position, UniverseCandidate
 
 
 class Base(DeclarativeBase):
@@ -125,9 +126,17 @@ class BotRepository:
     def __init__(self, session_factory: sessionmaker[Session]):
         self.session_factory = session_factory
 
-    def save_universe(self, as_of: date, candidates: Iterable[UniverseCandidate]) -> None:
+    def save_universe(
+        self,
+        as_of: date,
+        candidates: Iterable[UniverseCandidate],
+        market: MarketCountry = MarketCountry.KR,
+    ) -> None:
+        segments = segments_for(market)
         with self.session_factory() as session:
-            session.query(UniverseRow).filter(UniverseRow.as_of == as_of).delete()
+            session.query(UniverseRow).filter(
+                UniverseRow.as_of == as_of, UniverseRow.market.in_(segments)
+            ).delete(synchronize_session=False)
             for candidate in candidates:
                 session.add(
                     UniverseRow(
@@ -157,12 +166,20 @@ class BotRepository:
                 for row in rows
             ]
 
-    def load_latest_universe(self) -> list[UniverseCandidate]:
+    def load_latest_universe(self, market: MarketCountry = MarketCountry.KR) -> list[UniverseCandidate]:
+        segments = segments_for(market)
         with self.session_factory() as session:
-            latest = session.scalar(select(UniverseRow.as_of).order_by(UniverseRow.as_of.desc()).limit(1))
+            latest = session.scalar(
+                select(UniverseRow.as_of)
+                .where(UniverseRow.market.in_(segments))
+                .order_by(UniverseRow.as_of.desc())
+                .limit(1)
+            )
             if latest is None:
                 return []
-            rows = session.scalars(select(UniverseRow).where(UniverseRow.as_of == latest)).all()
+            rows = session.scalars(
+                select(UniverseRow).where(UniverseRow.as_of == latest, UniverseRow.market.in_(segments))
+            ).all()
             return [
                 UniverseCandidate(row.symbol, row.name, row.market, row.trading_value, row.close, row.volume)
                 for row in rows
@@ -202,20 +219,20 @@ class BotRepository:
                 for row in rows
             ]
 
-    def get_cash(self, initial_cash: Decimal) -> Decimal:
+    def get_cash(self, currency: str, initial_cash: Decimal) -> Decimal:
         with self.session_factory() as session:
-            row = session.get(PaperCashRow, "KRW")
+            row = session.get(PaperCashRow, currency)
             if row is None:
-                row = PaperCashRow(key="KRW", cash=initial_cash)
+                row = PaperCashRow(key=currency, cash=initial_cash)
                 session.add(row)
                 session.commit()
             return row.cash
 
-    def set_cash(self, cash: Decimal) -> None:
+    def set_cash(self, currency: str, cash: Decimal) -> None:
         with self.session_factory() as session:
-            row = session.get(PaperCashRow, "KRW")
+            row = session.get(PaperCashRow, currency)
             if row is None:
-                row = PaperCashRow(key="KRW", cash=cash)
+                row = PaperCashRow(key=currency, cash=cash)
                 session.add(row)
             else:
                 row.cash = cash
@@ -358,6 +375,16 @@ class BotRepository:
     def trades_ordered(self) -> list[TradeRow]:
         with self.session_factory() as session:
             return list(session.scalars(select(TradeRow).order_by(TradeRow.ts.asc(), TradeRow.id.asc())).all())
+
+    def last_sell_date(self, mode: str, symbol: str) -> date | None:
+        with self.session_factory() as session:
+            ts = session.scalar(
+                select(TradeRow.ts)
+                .where(TradeRow.mode == mode, TradeRow.symbol == symbol, TradeRow.side == OrderSide.SELL.value)
+                .order_by(TradeRow.ts.desc())
+                .limit(1)
+            )
+            return ts.date() if ts is not None else None
 
     def latest_order_audits(self, limit: int = 200) -> list[OrderAuditRow]:
         with self.session_factory() as session:

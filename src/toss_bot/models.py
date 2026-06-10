@@ -11,6 +11,16 @@ class RunMode(StrEnum):
     LIVE = "live"
 
 
+class MarketCountry(StrEnum):
+    KR = "KR"
+    US = "US"
+
+
+class Currency(StrEnum):
+    KRW = "KRW"
+    USD = "USD"
+
+
 class OrderSide(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
