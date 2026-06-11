@@ -49,7 +49,7 @@ markets:
       daily_drop_exit_pct: 0.035
       max_holding_days: 10
       min_edge_multiple: 3.0
-      reentry_cooldown_days: 1
+      reentry_cooldown_days: 5
       entry_cutoff_minutes: 10
     execution:
       max_entry_spread_bps: 25
@@ -96,7 +96,7 @@ markets:
       daily_drop_exit_pct: 0.045
       max_holding_days: 25
       min_edge_multiple: 5.0
-      reentry_cooldown_days: 5
+      reentry_cooldown_days: 10
       entry_cutoff_minutes: 30
     execution:
       max_entry_spread_bps: 15

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Iterable
 
@@ -57,6 +57,22 @@ class UniverseBuilder:
             return self._load_from_finance_datareader()
 
     def _load_from_pykrx(self, as_of: date) -> list[UniverseCandidate]:
+        # 장 시작 전이나 휴장일에는 당일 OHLCV가 비어 있으므로
+        # 데이터가 있는 가장 가까운 과거 영업일까지 거슬러 올라간다.
+        last_error: Exception | None = None
+        for offset in range(8):
+            try:
+                rows = self._load_pykrx_for_date(as_of - timedelta(days=offset))
+            except Exception as exc:
+                last_error = exc
+                continue
+            if rows:
+                return rows
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("KRX returned no candidates")
+
+    def _load_pykrx_for_date(self, as_of: date) -> list[UniverseCandidate]:
         from pykrx import stock
 
         date_text = as_of.strftime("%Y%m%d")
@@ -86,8 +102,6 @@ class UniverseBuilder:
                             volume=volume,
                         )
                     )
-        if not rows:
-            raise RuntimeError("KRX returned no candidates")
         return rows
 
     def _load_from_finance_datareader(self) -> list[UniverseCandidate]:

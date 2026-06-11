@@ -77,8 +77,9 @@ class StrategySettings(BaseModel):
     max_holding_days: int = 10
     # 비용 인지 게이트: 기대변동(일변동성×√보유일)이 왕복비용×배수 이상일 때만 진입
     min_edge_multiple: float = 3.0
-    # 청산 후 같은 종목 재진입 금지 기간(수수료 회전 방지)
-    reentry_cooldown_days: int = 1
+    # 청산 후 같은 종목 재진입 금지 기간(수수료 회전 방지).
+    # 백테스트 스윕에서 1일 → 5일이 전 구간 일관 개선 (손절 직후 재매수 churn 차단)
+    reentry_cooldown_days: int = 5
     # 정규장 종료 N분 전 신규 진입 차단 (KR은 종가 단일가 시작이 우선 적용)
     entry_cutoff_minutes: int = 10
 
@@ -141,7 +142,7 @@ def default_market_profiles() -> dict[str, dict]:
                 "daily_drop_exit_pct": 0.045,
                 "max_holding_days": 25,
                 "min_edge_multiple": 5.0,
-                "reentry_cooldown_days": 5,
+                "reentry_cooldown_days": 10,
                 "entry_cutoff_minutes": 30,
             },
             "execution": {

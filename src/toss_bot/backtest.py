@@ -25,6 +25,14 @@ class BacktestResult:
     warning: str | None = None
 
 
+@dataclass
+class _SimPosition:
+    quantity: Decimal
+    entry_price: Decimal
+    entry_date: date
+    high_watermark: Decimal
+
+
 class Backtester:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -44,9 +52,9 @@ class Backtester:
         for name, loader in loaders:
             try:
                 with quiet_external_data_source():
-                    closes = loader(start, end)
+                    frames = loader(start, end)
                 return self._rotation_backtest(
-                    closes, start, end, profile.strategy, profile.costs, initial, currency
+                    frames, start, end, profile.strategy, profile.costs, initial, currency
                 )
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
@@ -54,36 +62,47 @@ class Backtester:
 
     # --- 데이터 로더 ---------------------------------------------------------
 
-    def _load_kr_closes_krx(self, start: date, end: date) -> pd.DataFrame:
+    def _load_kr_closes_krx(self, start: date, end: date) -> dict[str, pd.DataFrame]:
         from pykrx import stock
 
         profile = self.settings.market_profile(MarketCountry.KR)
         lookback_start = start - timedelta(days=260)
         symbols: list[str] = []
-        date_text = end.strftime("%Y%m%d")
-        for segment in profile.universe.segments:
-            frame = stock.get_market_ohlcv(date_text, market=segment)
-            if frame.empty:
+        # 기준일이 휴장일이거나 KRX 응답이 비면 pykrx가 깨지므로 영업일을 거슬러 폴백한다.
+        for offset in range(8):
+            date_text = (end - timedelta(days=offset)).strftime("%Y%m%d")
+            try:
+                for segment in profile.universe.segments:
+                    frame = stock.get_market_ohlcv(date_text, market=segment)
+                    if frame.empty or "거래대금" not in frame:
+                        continue
+                    filtered = frame[frame["거래대금"] >= profile.universe.min_trading_value]
+                    top = filtered.sort_values("거래대금", ascending=False).head(profile.universe.watch_top_n)
+                    symbols.extend(str(symbol) for symbol in top.index)
+            except Exception:
+                symbols = []
                 continue
-            filtered = frame[frame["거래대금"] >= profile.universe.min_trading_value]
-            top = filtered.sort_values("거래대금", ascending=False).head(profile.universe.watch_top_n)
-            symbols.extend(str(symbol) for symbol in top.index)
+            if symbols:
+                break
         symbols = symbols[: profile.universe.watch_top_n]
         if not symbols:
             raise RuntimeError("No KRX symbols for backtest")
-        series = {}
+        columns = {"open": "시가", "high": "고가", "low": "저가", "close": "종가"}
+        series: dict[str, dict[str, pd.Series]] = {key: {} for key in columns}
         for symbol in symbols:
             frame = stock.get_market_ohlcv_by_date(
                 lookback_start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), symbol
             )
             if frame.empty or "종가" not in frame:
                 continue
-            series[symbol] = frame["종가"]
-        if not series:
+            for key, column in columns.items():
+                if column in frame:
+                    series[key][symbol] = frame[column]
+        if not series["close"]:
             raise RuntimeError("No close history for backtest")
-        return pd.DataFrame(series)
+        return {key: pd.DataFrame(values) for key, values in series.items() if values}
 
-    def _load_kr_closes_fdr(self, start: date, end: date) -> pd.DataFrame:
+    def _load_kr_closes_fdr(self, start: date, end: date) -> dict[str, pd.DataFrame]:
         import FinanceDataReader as fdr
 
         profile = self.settings.market_profile(MarketCountry.KR)
@@ -97,7 +116,7 @@ class Backtester:
         symbols = [str(code).zfill(6) for code in listing["Code"].head(profile.universe.watch_top_n)]
         return self._load_fdr_frame(fdr, symbols, start - timedelta(days=260), end)
 
-    def _load_us_closes_fdr(self, start: date, end: date) -> pd.DataFrame:
+    def _load_us_closes_fdr(self, start: date, end: date) -> dict[str, pd.DataFrame]:
         import FinanceDataReader as fdr
 
         profile = self.settings.market_profile(MarketCountry.US)
@@ -109,8 +128,9 @@ class Backtester:
             raise RuntimeError("No US candidate symbols configured for backtest")
         return self._load_fdr_frame(fdr, symbols, start - timedelta(days=260), end)
 
-    def _load_fdr_frame(self, fdr, symbols: list[str], start: date, end: date) -> pd.DataFrame:
-        series = {}
+    def _load_fdr_frame(self, fdr, symbols: list[str], start: date, end: date) -> dict[str, pd.DataFrame]:
+        columns = {"open": "Open", "high": "High", "low": "Low", "close": "Close"}
+        series: dict[str, dict[str, pd.Series]] = {key: {} for key in columns}
         for symbol in symbols:
             try:
                 frame = fdr.DataReader(symbol, start.isoformat(), end.isoformat())
@@ -118,16 +138,18 @@ class Backtester:
                 continue
             if frame.empty or "Close" not in frame:
                 continue
-            series[symbol] = frame["Close"]
-        if not series:
+            for key, column in columns.items():
+                if column in frame:
+                    series[key][symbol] = frame[column]
+        if not series["close"]:
             raise RuntimeError("No FinanceDataReader close history for backtest")
-        return pd.DataFrame(series)
+        return {key: pd.DataFrame(values) for key, values in series.items() if values}
 
     # --- 시뮬레이션 ----------------------------------------------------------
 
     def _rotation_backtest(
         self,
-        closes: pd.DataFrame,
+        frames: dict[str, pd.DataFrame],
         start: date,
         end: date,
         strategy_settings: StrategySettings,
@@ -135,52 +157,108 @@ class Backtester:
         initial: Decimal,
         currency: str,
     ) -> BacktestResult:
-        closes = closes.dropna(axis=1, thresh=140).ffill()
+        closes = frames["close"].dropna(axis=1, thresh=140).ffill()
+        opens = self._aligned(frames.get("open"), closes)
+        highs = self._aligned(frames.get("high"), closes)
+        lows = self._aligned(frames.get("low"), closes)
         trading_days = [day.date() for day in closes.index if start <= day.date() <= end]
         if not trading_days:
             raise RuntimeError("No trading days for backtest")
 
+        strategy = HybridMomentumStrategy(strategy_settings, costs)
+        round_trip = strategy.round_trip_cost
         cash = initial
-        holdings: dict[str, Decimal] = {}
+        holdings: dict[str, _SimPosition] = {}
+        last_sell: dict[str, date] = {}
         trades = 0
         max_window = max(strategy_settings.momentum_windows)
+        last_rebalance_week: tuple[int, int] | None = None
 
-        for idx, day in enumerate(trading_days):
+        for day in trading_days:
             timestamp = pd.Timestamp(day)
-            if idx < max_window or (timestamp.weekday() != 0 and idx != max_window):
-                continue
-            prices = closes.loc[:timestamp].tail(max_window + 1)
-            ranked = self._rank_from_close_frame(prices, strategy_settings)
-            selected = ranked[: strategy_settings.max_positions]
-            if not selected:
-                continue
-            current_prices = closes.loc[timestamp]
-            equity = self._equity(cash, holdings, current_prices)
+            row_close = closes.loc[timestamp]
+            row_open = opens.loc[timestamp] if opens is not None else row_close
+            row_high = highs.loc[timestamp] if highs is not None else row_close
+            row_low = lows.loc[timestamp] if lows is not None else row_close
 
-            for symbol in list(holdings):
-                if symbol not in selected:
-                    price = dec(current_prices[symbol])
-                    cash += self._sell_value(holdings.pop(symbol), price, costs)
+            # 실전 청산 엔진을 일봉 OHLC로 근사: 손절/트레일링/본전보호/시간청산
+            for symbol, position in list(holdings.items()):
+                if pd.isna(row_close[symbol]):
+                    continue
+                close_price = dec(row_close[symbol])
+                open_price = dec(row_open[symbol]) if not pd.isna(row_open[symbol]) else close_price
+                high_price = dec(row_high[symbol]) if not pd.isna(row_high[symbol]) else close_price
+                low_price = dec(row_low[symbol]) if not pd.isna(row_low[symbol]) else close_price
+                position.high_watermark = max(position.high_watermark, high_price)
+                profit_hwm = position.high_watermark / position.entry_price - Decimal("1")
+                is_locked_winner = profit_hwm >= dec(strategy_settings.profit_lock_trigger_pct)
+                trail_pct = (
+                    dec(strategy_settings.profit_lock_trailing_stop_pct)
+                    if is_locked_winner
+                    else dec(strategy_settings.trailing_stop_pct)
+                )
+                stop = position.entry_price * (Decimal("1") - dec(strategy_settings.stop_loss_pct))
+                stop = max(stop, position.high_watermark * (Decimal("1") - trail_pct))
+                if profit_hwm >= dec(strategy_settings.breakeven_trigger_pct):
+                    buffer = max(dec(strategy_settings.breakeven_buffer_pct), round_trip)
+                    stop = max(stop, position.entry_price * (Decimal("1") + buffer))
+                exit_price = None
+                if open_price > 0 and open_price <= stop:
+                    exit_price = open_price  # 갭하락은 스탑가가 아니라 시가 체결로 근사
+                elif low_price <= stop:
+                    exit_price = stop
+                elif (
+                    (day - position.entry_date).days >= strategy_settings.max_holding_days
+                    and not is_locked_winner
+                ):
+                    exit_price = close_price
+                if exit_price is not None:
+                    cash += self._sell_value(position.quantity, exit_price, costs)
+                    del holdings[symbol]
+                    last_sell[symbol] = day
                     trades += 1
 
+            # 룩백 데이터는 시작일 이전 260일치를 이미 로드했으므로 워밍업 스킵 없이
+            # 첫 거래일과 매주 첫 거래일(월요일 휴장 포함)에 신규 진입을 평가한다.
+            iso = day.isocalendar()
+            week = (iso[0], iso[1])
+            if week == last_rebalance_week:
+                continue
+            last_rebalance_week = week
+            prices = closes.loc[:timestamp].tail(max_window + 1)
+            ranked = self._rank_from_close_frame(prices, strategy_settings)
+            if not ranked:
+                continue
+            quantities = {symbol: position.quantity for symbol, position in holdings.items()}
+            equity = self._equity(cash, quantities, row_close)
             target_weight = min(
                 dec(self.settings.risk.max_symbol_weight),
-                (Decimal("1") - dec(self.settings.risk.min_cash_weight)) / Decimal(len(selected)),
+                (Decimal("1") - dec(self.settings.risk.min_cash_weight)) / Decimal(strategy_settings.max_positions),
             )
             target_value = equity * target_weight
-            for symbol in selected:
-                price = dec(current_prices[symbol])
-                if price <= 0 or symbol in holdings:
+            reserve = equity * dec(self.settings.risk.min_cash_weight)
+            for symbol in ranked:
+                if len(holdings) >= strategy_settings.max_positions:
+                    break
+                if symbol in holdings or pd.isna(row_close[symbol]):
+                    continue
+                sold_on = last_sell.get(symbol)
+                if sold_on is not None and (day - sold_on).days < strategy_settings.reentry_cooldown_days:
+                    continue
+                price = dec(row_close[symbol])
+                if price <= 0:
                     continue
                 quantity = (target_value / price).to_integral_value(rounding=ROUND_DOWN)
                 total_cost = self._buy_cost(quantity, price, costs)
-                if quantity > 0 and total_cost <= cash:
+                if quantity > 0 and total_cost <= cash - reserve:
                     cash -= total_cost
-                    holdings[symbol] = quantity
+                    fill_price = self._slipped(price, costs, buy=True)
+                    holdings[symbol] = _SimPosition(quantity, fill_price, day, fill_price)
                     trades += 1
 
         final_prices = closes.loc[pd.Timestamp(trading_days[-1])]
-        end_equity = money(self._equity(cash, holdings, final_prices))
+        final_quantities = {symbol: position.quantity for symbol, position in holdings.items()}
+        end_equity = money(self._equity(cash, final_quantities, final_prices))
         return BacktestResult(
             start=start,
             end=end,
@@ -188,10 +266,18 @@ class Backtester:
             end_equity=end_equity,
             total_return=(end_equity / initial) - Decimal("1"),
             trades=trades,
-            method="daily_proxy_with_live_ranking",
+            method="daily_ohlc_sim_with_stops",
             currency=currency,
-            warning="Proxy backtest: intraday breakout, orderbook execution, stops, and session policy are not simulated.",
+            warning=(
+                "Proxy backtest: entries are weekly at close (no intraday breakout/orderbook); "
+                "stops and time exits are approximated on daily OHLC."
+            ),
         )
+
+    def _aligned(self, frame: pd.DataFrame | None, closes: pd.DataFrame) -> pd.DataFrame | None:
+        if frame is None:
+            return None
+        return frame.reindex(index=closes.index, columns=closes.columns).ffill()
 
     def _fallback_cost_smoke(
         self,

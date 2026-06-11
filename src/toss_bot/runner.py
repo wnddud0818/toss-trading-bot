@@ -14,7 +14,7 @@ from .fx import FxRateProvider
 from .market_calendar import MarketSession, parse_market_session
 from .market_filter import MarketFilter
 from .markets import currency_for, market_for_symbol
-from .models import Candle, MarketCountry, OrderSide, RunMode, Signal
+from .models import Candle, MarketCountry, OrderSide, Position, RunMode, Signal
 from .notifications import DiscordNotifier
 from .order_reconcile import OrderReconciler, ReconcileReport
 from .reports import ReportWriter
@@ -27,6 +27,10 @@ from .utils import dec, extract_items, now_kst, parse_toss_candle
 logger = logging.getLogger(__name__)
 
 SESSION_CACHE_TTL_SECONDS = 1800
+# 유니버스 전 종목 일봉 재조회는 비싸므로 랭킹을 잠시 캐시한다.
+RANK_CACHE_TTL_SECONDS = 300
+# 정규장 전체(KR 381분, US 390분)를 덮어 세션 시가·VWAP·박스 계산이 온전하도록 한다.
+INTRADAY_CANDLE_COUNT = 400
 US_EASTERN = ZoneInfo("America/New_York")
 
 
@@ -51,7 +55,7 @@ class TradingBot:
             for market, profile in self.profiles.items()
         }
         self.strategies = {
-            market: HybridMomentumStrategy(profile.strategy, profile.costs)
+            market: HybridMomentumStrategy(profile.strategy, profile.costs, market)
             for market, profile in self.profiles.items()
         }
         self.planners = {
@@ -68,6 +72,7 @@ class TradingBot:
         self.report_writer = ReportWriter(settings, repository)
         self.broker = self._make_broker()
         self._session_cache: dict[tuple[MarketCountry, date], tuple[float, MarketSession]] = {}
+        self._rank_cache: dict[MarketCountry, tuple[float, list]] = {}
         equity = self.broker.portfolio_value({})
         today = now_kst().date()
         iso = today.isocalendar()
@@ -101,6 +106,7 @@ class TradingBot:
             return
         as_of = as_of or _market_date(market, now_kst())
         candidates = self.universe_builders[market].refresh(as_of)
+        self._rank_cache.pop(market, None)
         self.notifier.send(f"[toss-bot] {market} universe refreshed: {len(candidates)} candidates")
 
     def premarket_report(self, market: MarketCountry | str = MarketCountry.KR) -> None:
@@ -173,9 +179,19 @@ class TradingBot:
         strategy = self.strategies[market]
         for position in list(positions.values()):
             try:
-                candles = self._candles(position.symbol, "1m", 80)
+                candles = self._candles(position.symbol, "1m", INTRADAY_CANDLE_COUNT)
                 if candles:
-                    self._update_high_watermark(position.symbol, max(candle.high for candle in candles))
+                    session_high = max(candle.high for candle in candles)
+                    self._update_high_watermark(position.symbol, session_high)
+                    if session_high > position.high_watermark:
+                        # 저장만 하고 stale 포지션으로 판정하면 트레일링 스탑이 한 루프 늦게 조여진다.
+                        position = Position(
+                            symbol=position.symbol,
+                            quantity=position.quantity,
+                            entry_price=position.entry_price,
+                            entry_date=position.entry_date,
+                            high_watermark=session_high,
+                        )
                 signal = strategy.exit_signal(position, candles, today, market_filter_ok=market_ok)
                 if signal is None:
                     continue
@@ -193,7 +209,12 @@ class TradingBot:
         open_count = sum(
             1 for position in self.broker.positions() if market_for_symbol(position.symbol) == market
         )
-        for candidate in self._ranked_candidates(market)[: profile.strategy.max_positions]:
+        # 상위 후보 다수는 당일 돌파 조건을 못 채우므로 max_positions보다 넓게 본다.
+        # 포지션 수 한도는 can_enter가 매 진입마다 다시 확인한다.
+        candidate_pool = self._ranked_candidates(market)[: profile.strategy.max_positions * 3]
+        for candidate in candidate_pool:
+            if open_count >= profile.strategy.max_positions:
+                break
             try:
                 last_sell = self.repository.last_sell_date(self.settings.mode.value, candidate.symbol)
                 if (
@@ -219,7 +240,7 @@ class TradingBot:
                     logger.info("Skip entry %s: budget below minimum order amount", candidate.symbol)
                     continue
                 daily = self._candles(candidate.symbol, "1d", 130)
-                intraday = self._candles(candidate.symbol, "1m", 80)
+                intraday = self._candles(candidate.symbol, "1m", INTRADAY_CANDLE_COUNT)
                 signal = self.strategies[market].entry_signal(candidate, daily, intraday, budget)
                 if signal is None:
                     continue
@@ -266,9 +287,15 @@ class TradingBot:
             updater(symbol, high_watermark)
 
     def _ranked_candidates(self, market: MarketCountry):
+        # 유니버스 전 종목의 일봉을 매 분 다시 받으면 API 한도와 루프 시간을 잡아먹는다.
+        cached = self._rank_cache.get(market)
+        if cached is not None and time.time() - cached[0] < RANK_CACHE_TTL_SECONDS:
+            return cached[1]
         universe = self.repository.load_latest_universe(market)
         daily = {candidate.symbol: self._candles(candidate.symbol, "1d", 130) for candidate in universe}
-        return self.strategies[market].rank_candidates(universe, daily)
+        ranked = self.strategies[market].rank_candidates(universe, daily)
+        self._rank_cache[market] = (time.time(), ranked)
+        return ranked
 
     def _candles(self, symbol: str, interval: str, count: int) -> list[Candle]:
         result = self.toss_client.get_candles(symbol, interval, count)

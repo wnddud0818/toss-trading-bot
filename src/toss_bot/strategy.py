@@ -1,19 +1,34 @@
 from __future__ import annotations
 
 import math
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from statistics import pstdev
 
 from .config import CostSettings, StrategySettings
-from .models import Candle, OrderSide, OrderType, Position, RankedCandidate, Signal, UniverseCandidate
-from .utils import dec, money, qty
+from .markets import align_price
+from .models import Candle, MarketCountry, OrderSide, OrderType, Position, RankedCandidate, Signal, UniverseCandidate
+from .utils import dec, qty
+
+# 인접 분봉 간격이 이보다 크면 세션(거래일) 경계로 본다.
+SESSION_GAP_MINUTES = 30
+# 시장별 거래대금 만점 기준 (KR: 1000억 KRW, US: 1억 USD)
+LIQUIDITY_FULL_SCORE_VALUE = {
+    MarketCountry.KR: Decimal("100000000000"),
+    MarketCountry.US: Decimal("100000000"),
+}
 
 
 class HybridMomentumStrategy:
-    def __init__(self, settings: StrategySettings, costs: CostSettings | None = None):
+    def __init__(
+        self,
+        settings: StrategySettings,
+        costs: CostSettings | None = None,
+        market: MarketCountry = MarketCountry.KR,
+    ):
         self.settings = settings
         self.costs = costs or CostSettings.zero()
+        self.market = market
 
     @property
     def round_trip_cost(self) -> Decimal:
@@ -71,7 +86,7 @@ class HybridMomentumStrategy:
         intraday_candles: list[Candle],
         budget: Decimal,
     ) -> Signal | None:
-        if len(daily_candles) < 2 or len(intraday_candles) < self.settings.intraday_box_minutes + 1:
+        if len(daily_candles) < 2:
             return None
         # 비용 허들: 보유기간 동안 기대할 수 있는 변동(일변동성×√보유일)이
         # 왕복비용×배수를 넘지 못하면 수수료를 회수할 가능성이 낮으므로 진입하지 않는다.
@@ -79,23 +94,31 @@ class HybridMomentumStrategy:
         if expected_move < self.round_trip_cost * dec(self.settings.min_edge_multiple):
             return None
         daily_sorted = sorted(daily_candles, key=lambda candle: candle.timestamp)
-        intraday_sorted = sorted(intraday_candles, key=lambda candle: candle.timestamp)
-        latest = intraday_sorted[-1]
+        # 장 초반에는 조회된 분봉 대부분이 전일 세션 데이터이므로 현재 세션 분봉만 사용한다.
+        session = _session_slice(sorted(intraday_candles, key=lambda candle: candle.timestamp))
+        if len(session) < self.settings.intraday_box_minutes + 2:
+            return None
+        latest = session[-1]
+        # 루프가 분 초입에 돌므로 latest는 거래량이 수 초치뿐인 미완성 분봉이다.
+        # 돌파·거래량 스파이크는 직전 완성 분봉으로 확인하고,
+        # 미완성 분봉은 돌파 수준을 여전히 지키는지 확인하는 데만 쓴다.
+        confirm = session[-2]
+        session_open = session[0].open
         previous_day_high = daily_sorted[-2].high
         previous_close = daily_sorted[-2].close
-        if latest.open >= previous_close * (Decimal("1") + dec(self.settings.max_gap_up_pct)):
+        if session_open >= previous_close * (Decimal("1") + dec(self.settings.max_gap_up_pct)):
             return None
-        if latest.close >= intraday_sorted[0].open * (Decimal("1") + dec(self.settings.max_intraday_extension_pct)):
+        if latest.close >= session_open * (Decimal("1") + dec(self.settings.max_intraday_extension_pct)):
             return None
-        box = intraday_sorted[-self.settings.intraday_box_minutes - 1 : -1]
+        box = session[-self.settings.intraday_box_minutes - 2 : -2]
         box_high = max(candle.high for candle in box)
         breakout_level = max(previous_day_high, box_high) * (Decimal("1") + dec(self.settings.breakout_buffer_pct))
         avg_volume = sum(candle.volume for candle in box) / Decimal(len(box))
-        volume_ok = latest.volume >= avg_volume * dec(self.settings.volume_spike_multiplier)
-        price_ok = latest.close > breakout_level
+        volume_ok = confirm.volume >= avg_volume * dec(self.settings.volume_spike_multiplier)
+        price_ok = confirm.close > breakout_level and latest.close > breakout_level
         if not (price_ok and volume_ok):
             return None
-        if self.settings.require_vwap_confirmation and latest.close < self._vwap(intraday_sorted):
+        if self.settings.require_vwap_confirmation and latest.close < self._vwap(session):
             return None
         if len(daily_sorted) >= 20:
             ma20 = self._moving_average(daily_sorted[-20:])
@@ -109,7 +132,7 @@ class HybridMomentumStrategy:
             side=OrderSide.BUY,
             order_type=OrderType.LIMIT,
             quantity=quantity,
-            limit_price=money(latest.close),
+            limit_price=align_price(latest.close, side=OrderSide.BUY.value, market=self.market),
             reason="momentum breakout with volume spike",
         )
 
@@ -122,24 +145,30 @@ class HybridMomentumStrategy:
     ) -> Signal | None:
         if not intraday_candles:
             return None
-        intraday_sorted = sorted(intraday_candles, key=lambda candle: candle.timestamp)
-        latest = intraday_sorted[-1]
-        high_watermark = max(position.high_watermark, latest.high)
+        session = _session_slice(sorted(intraday_candles, key=lambda candle: candle.timestamp))
+        latest = session[-1]
+        high_watermark = max(position.high_watermark, max(candle.high for candle in session))
         fixed_stop = position.entry_price * (Decimal("1") - dec(self.settings.stop_loss_pct))
         profit_from_entry = high_watermark / position.entry_price - Decimal("1")
+        close_profit = latest.close / position.entry_price - Decimal("1")
+        is_locked_winner = profit_from_entry >= dec(self.settings.profit_lock_trigger_pct)
         trailing_pct = dec(self.settings.trailing_stop_pct)
         trailing_reason = "trailing stop"
-        if profit_from_entry >= dec(self.settings.profit_lock_trigger_pct):
+        if is_locked_winner:
             trailing_pct = dec(self.settings.profit_lock_trailing_stop_pct)
             trailing_reason = "profit lock trailing stop"
+        elif not market_filter_ok:
+            # 리스크오프에서 수익 포지션은 즉시 던지지 않고 트레일만 조여 추세 여력을 남긴다.
+            trailing_pct = min(trailing_pct, dec(self.settings.profit_lock_trailing_stop_pct))
+            trailing_reason = "risk-off tightened trailing stop"
         trailing_stop = high_watermark * (Decimal("1") - trailing_pct)
         breakeven_stop = None
         if profit_from_entry >= dec(self.settings.breakeven_trigger_pct):
             # 본전 보호는 왕복 비용까지 덮어야 실제로 본전이다.
             buffer = max(dec(self.settings.breakeven_buffer_pct), self.round_trip_cost)
             breakeven_stop = position.entry_price * (Decimal("1") + buffer)
-        open_price = intraday_sorted[0].open
-        daily_drop = latest.close <= open_price * (Decimal("1") - dec(self.settings.daily_drop_exit_pct))
+        session_open = session[0].open
+        daily_drop = latest.close <= session_open * (Decimal("1") - dec(self.settings.daily_drop_exit_pct))
         held_days = (today - position.entry_date).days
         reason = None
         if latest.close <= fixed_stop:
@@ -150,9 +179,12 @@ class HybridMomentumStrategy:
             reason = trailing_reason
         elif daily_drop:
             reason = "intraday drop exit"
-        elif not market_filter_ok:
+        elif not market_filter_ok and close_profit < self.round_trip_cost:
+            # 리스크오프 일괄 청산은 지수 MA 부근 왕복에서 비용만 태운다. 미수익 포지션만 정리한다.
             reason = "market filter risk-off"
-        elif held_days >= self.settings.max_holding_days:
+        elif held_days >= self.settings.max_holding_days and not is_locked_winner:
+            # 시간 청산은 추세를 못 만든 포지션용이다. 이익 보호 구간에 도달한
+            # 승자는 조여진 트레일링이 관리하므로 강제 청산으로 추세를 자르지 않는다.
             reason = "max holding days"
         if reason is None:
             return None
@@ -161,7 +193,7 @@ class HybridMomentumStrategy:
             side=OrderSide.SELL,
             order_type=OrderType.LIMIT,
             quantity=position.quantity,
-            limit_price=money(latest.close),
+            limit_price=align_price(latest.close, side=OrderSide.SELL.value, market=self.market),
             reason=reason,
         )
 
@@ -190,10 +222,13 @@ class HybridMomentumStrategy:
                 return False
         if self._volume_accumulation_ratio(candles) < dec(self.settings.min_volume_accumulation_ratio):
             return False
+        # 최근 한 달 내 급등만 배제한다. 전체 이력으로 보면 강한 모멘텀 종목이
+        # 과거 급등 이력 때문에 전부 걸러져 후보가 사라진다.
+        recent = candles[-25:]
         max_5d = max(
-            abs(candles[index].close / candles[index - 5].close - Decimal("1"))
-            for index in range(5, len(candles))
-            if candles[index - 5].close > 0
+            abs(recent[index].close / recent[index - 5].close - Decimal("1"))
+            for index in range(5, len(recent))
+            if recent[index - 5].close > 0
         )
         if max_5d > dec(self.settings.max_5d_return_pct):
             return False
@@ -245,7 +280,7 @@ class HybridMomentumStrategy:
     def _liquidity_score(self, trading_value: Decimal) -> Decimal:
         if trading_value <= 0:
             return Decimal("0")
-        return min(trading_value / Decimal("100000000000"), Decimal("1"))
+        return min(trading_value / LIQUIDITY_FULL_SCORE_VALUE[self.market], Decimal("1"))
 
     def _vwap(self, candles: list[Candle]) -> Decimal:
         volume = sum(candle.volume for candle in candles)
@@ -265,3 +300,17 @@ class HybridMomentumStrategy:
         if not returns:
             return Decimal("0")
         return dec(max(pstdev(returns), 0.0001))
+
+
+def _session_slice(candles_sorted: list[Candle], max_gap_minutes: int = SESSION_GAP_MINUTES) -> list[Candle]:
+    """최신 캔들부터 거슬러 올라가며 세션 경계(큰 시간 간격)에서 잘라 현재 세션 분봉만 남긴다.
+    US 세션은 KST 자정을 넘기므로 날짜가 아니라 간격으로 자른다."""
+    if not candles_sorted:
+        return candles_sorted
+    max_gap = timedelta(minutes=max_gap_minutes)
+    start_index = 0
+    for index in range(len(candles_sorted) - 1, 0, -1):
+        if candles_sorted[index].timestamp - candles_sorted[index - 1].timestamp > max_gap:
+            start_index = index
+            break
+    return candles_sorted[start_index:]

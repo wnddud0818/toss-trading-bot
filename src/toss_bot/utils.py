@@ -4,7 +4,7 @@ import uuid
 import logging
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
+from decimal import Decimal, ROUND_DOWN
 from io import StringIO
 from zoneinfo import ZoneInfo
 
@@ -23,29 +23,6 @@ def money(value: Decimal) -> Decimal:
 
 def qty(value: Decimal) -> Decimal:
     return value.quantize(Decimal("1"), rounding=ROUND_DOWN)
-
-
-def kr_tick_size(price: Decimal) -> Decimal:
-    if price < Decimal("2000"):
-        return Decimal("1")
-    if price < Decimal("5000"):
-        return Decimal("5")
-    if price < Decimal("20000"):
-        return Decimal("10")
-    if price < Decimal("50000"):
-        return Decimal("50")
-    if price < Decimal("200000"):
-        return Decimal("100")
-    if price < Decimal("500000"):
-        return Decimal("500")
-    return Decimal("1000")
-
-
-def align_kr_price(price: Decimal, *, side: str) -> Decimal:
-    tick = kr_tick_size(price)
-    rounding = ROUND_CEILING if side == "BUY" else ROUND_FLOOR
-    ticks = (price / tick).to_integral_value(rounding=rounding)
-    return ticks * tick
 
 
 def make_client_order_id(symbol: str, side: OrderSide, prefix: str = "tb") -> str:
