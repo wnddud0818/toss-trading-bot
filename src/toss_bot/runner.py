@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 SESSION_CACHE_TTL_SECONDS = 1800
 # 유니버스 전 종목 일봉 재조회는 비싸므로 랭킹을 잠시 캐시한다.
 RANK_CACHE_TTL_SECONDS = 300
+# 일변동성은 분 단위로 거의 변하지 않으므로 길게 캐시한다.
+VOLATILITY_CACHE_TTL_SECONDS = 1800
 # 정규장 전체(KR 381분, US 390분)를 덮어 세션 시가·VWAP·박스 계산이 온전하도록 한다.
 INTRADAY_CANDLE_COUNT = 400
 US_EASTERN = ZoneInfo("America/New_York")
@@ -73,6 +75,7 @@ class TradingBot:
         self.broker = self._make_broker()
         self._session_cache: dict[tuple[MarketCountry, date], tuple[float, MarketSession]] = {}
         self._rank_cache: dict[MarketCountry, tuple[float, list]] = {}
+        self._volatility_cache: dict[str, tuple[float, Decimal | None]] = {}
         equity = self.broker.portfolio_value({})
         today = now_kst().date()
         iso = today.isocalendar()
@@ -192,7 +195,13 @@ class TradingBot:
                             entry_date=position.entry_date,
                             high_watermark=session_high,
                         )
-                signal = strategy.exit_signal(position, candles, today, market_filter_ok=market_ok)
+                signal = strategy.exit_signal(
+                    position,
+                    candles,
+                    today,
+                    market_filter_ok=market_ok,
+                    daily_volatility=self._daily_volatility(market, position.symbol),
+                )
                 if signal is None:
                     continue
                 self._place_signal(market, signal, urgent=True)
@@ -232,9 +241,9 @@ class TradingBot:
                 if not can_enter:
                     logger.info("Skip entry %s: %s", candidate.symbol, reason)
                     continue
-                budget_krw = self.risk.position_budget(
-                    cash_krw, candidate.volatility, dec(profile.strategy.stop_loss_pct)
-                )
+                # 변동성으로 넓어진 스탑만큼 포지션을 줄여 1회 손실(max_entry_risk_pct)을 일정하게 유지한다.
+                effective_stop = self.strategies[market].effective_stop_loss_pct(candidate.volatility)
+                budget_krw = self.risk.position_budget(cash_krw, candidate.volatility, effective_stop)
                 budget = self.fx.from_krw(budget_krw, currency)
                 if budget < Decimal(profile.costs.min_order_amount):
                     logger.info("Skip entry %s: budget below minimum order amount", candidate.symbol)
@@ -300,6 +309,23 @@ class TradingBot:
     def _candles(self, symbol: str, interval: str, count: int) -> list[Candle]:
         result = self.toss_client.get_candles(symbol, interval, count)
         return [parse_toss_candle(item) for item in extract_items(result, "candles")]
+
+    def _daily_volatility(self, market: MarketCountry, symbol: str) -> Decimal | None:
+        cached = self._volatility_cache.get(symbol)
+        if cached is not None and time.time() - cached[0] < VOLATILITY_CACHE_TTL_SECONDS:
+            return cached[1]
+        strategy = self.strategies[market]
+        volatility: Decimal | None = None
+        try:
+            window = strategy.settings.volatility_window
+            candles = sorted(self._candles(symbol, "1d", window + 5), key=lambda candle: candle.timestamp)
+            if len(candles) >= 2:
+                volatility = strategy._volatility(candles[-window:])
+        except Exception:
+            # 변동성 조회 실패는 기본(고정) 스탑 폭으로 동작하면 되므로 청산을 막지 않는다.
+            logger.warning("Daily volatility fetch failed for %s; using fixed stops", symbol, exc_info=True)
+        self._volatility_cache[symbol] = (time.time(), volatility)
+        return volatility
 
     def _latest_prices(self, symbols: list[str]) -> dict[str, Decimal]:
         if not symbols:

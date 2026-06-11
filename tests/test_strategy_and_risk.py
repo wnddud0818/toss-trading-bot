@@ -279,6 +279,59 @@ def test_risk_off_exits_losers_but_trails_winners():
     assert tightened.reason == "risk-off tightened trailing stop"
 
 
+def test_exit_stop_widens_with_volatility():
+    settings = StrategySettings(
+        stop_loss_pct=0.04,
+        max_stop_loss_pct=0.08,
+        stop_volatility_multiple=2.5,
+        trailing_stop_pct=0.03,
+        max_trailing_stop_pct=0.06,
+        trailing_volatility_multiple=2.0,
+        breakeven_trigger_pct=9.9,
+        profit_lock_trigger_pct=9.9,
+        daily_drop_exit_pct=0.5,
+        max_holding_days=100,
+    )
+    strategy = HybridMomentumStrategy(settings)
+    position = Position("000001", Decimal("10"), Decimal("100"), date(2026, 6, 9), Decimal("100"))
+
+    # 변동성 정보가 없으면 기존 고정 스탑(4%) 그대로: 95.5에서 손절
+    no_vol = strategy.exit_signal(position, [candle(0, "95.5")], date(2026, 6, 10))
+    assert no_vol is not None
+    assert no_vol.reason == "fixed stop loss"
+
+    # 일변동성 3% 종목은 스탑이 7.5%로 넓어져 같은 -4.5%에서 버틴다 (노이즈 손절 방지)
+    assert (
+        strategy.exit_signal(position, [candle(0, "95.5")], date(2026, 6, 10), daily_volatility=Decimal("0.03"))
+        is None
+    )
+
+
+def test_exit_stop_capped_at_max_even_for_extreme_volatility():
+    settings = StrategySettings(
+        stop_loss_pct=0.04,
+        max_stop_loss_pct=0.08,
+        stop_volatility_multiple=2.5,
+        trailing_stop_pct=0.5,
+        max_trailing_stop_pct=0.5,
+        breakeven_trigger_pct=9.9,
+        profit_lock_trigger_pct=9.9,
+        daily_drop_exit_pct=0.5,
+        max_holding_days=100,
+    )
+    strategy = HybridMomentumStrategy(settings)
+    position = Position("000001", Decimal("10"), Decimal("100"), date(2026, 6, 9), Decimal("100"))
+
+    # 변동성 10%여도 스탑은 cap(8%)까지만 넓어진다: 92 이하에서는 반드시 손절
+    capped = strategy.exit_signal(position, [candle(0, "91.9")], date(2026, 6, 10), daily_volatility=Decimal("0.10"))
+    assert capped is not None
+    assert capped.reason == "fixed stop loss"
+    assert (
+        strategy.exit_signal(position, [candle(0, "92.1")], date(2026, 6, 10), daily_volatility=Decimal("0.10"))
+        is None
+    )
+
+
 def test_risk_blocks_daily_loss_limit():
     state = RiskState(
         start_day_equity=Decimal("1000000"),

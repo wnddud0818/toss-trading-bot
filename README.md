@@ -140,10 +140,10 @@ ENABLE_LIVE_TRADING=true
 - `max_drawdown_from_high_pct`: 최근 고점 대비 낙폭 제한
 - `require_vwap_confirmation`: VWAP 위 돌파만 허용
 - `max_intraday_extension_pct`: 장중 과열 추격 제한
-- `stop_loss_pct`: 고정 손절
-- `trailing_stop_pct`: 기본 트레일링 스탑
-- `profit_lock_trigger_pct`: 이익 보호 트레일링 시작 수익률
-- `profit_lock_trailing_stop_pct`: 이익 보호 구간 트레일링 폭
+- `stop_loss_pct`, `max_stop_loss_pct`, `stop_volatility_multiple`: 손절 폭 = clamp(일변동성 × multiple, 기본, max). 변동성 큰 종목의 노이즈 손절을 막고, 넓어진 만큼 포지션 크기를 줄여 1회 손실을 고정합니다
+- `trailing_stop_pct`, `max_trailing_stop_pct`, `trailing_volatility_multiple`: 트레일링 스탑도 같은 방식으로 변동성에 적응
+- `profit_lock_trigger_pct`: 이익 보호 트레일링 시작 수익률. 백테스트 스윕 결과 KR은 러너를 일찍 잘라 수익을 깎으므로 사실상 비활성(1.00), US는 0.12 활성이 우세했습니다
+- `profit_lock_trailing_stop_pct`: 이익 보호 구간 트레일링 폭 (리스크오프 트레일 조임 폭으로도 사용)
 
 ### risk
 
@@ -170,7 +170,7 @@ ENABLE_LIVE_TRADING=true
 ## 운영 순서
 
 1. `toss-bot doctor`로 인증과 계좌 상태를 확인합니다.
-2. `toss-bot backtest`로 전략이 비용 포함 후에도 의미 있는지 확인합니다.
+2. `toss-bot backtest`로 전략이 비용 포함 후에도 의미 있는지 확인합니다. 백테스트는 일봉 OHLC로 손절·트레일링·시간청산·레짐 필터(동일가중 지수 MA60)·비용 허들을 근사하며, `scripts/param_sweep.py`로 파라미터 격자를 비교할 수 있습니다.
 3. `mode: paper`에서 최소 20거래일 이상 `toss-bot run --mode paper`를 돌립니다.
 4. `reports/YYYY-MM-DD.md`에서 주문 감사, 체결 기록, 실현손익 요약을 확인합니다.
 5. 실거래 전 `max_live_order_amount_krw`를 아주 작게 낮춰 소액 검증합니다.

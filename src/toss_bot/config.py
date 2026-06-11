@@ -67,14 +67,23 @@ class StrategySettings(BaseModel):
     require_vwap_confirmation: bool = True
     volume_spike_multiplier: float = 1.5
     intraday_box_minutes: int = 20
+    # 고정 스탑은 변동성 큰 종목에서 노이즈 손절(churn)을 유발한다.
+    # 실제 스탑 폭 = clamp(변동성 × multiple, 기본값(floor), max값(cap))
     stop_loss_pct: float = 0.04
+    max_stop_loss_pct: float = 0.08
+    stop_volatility_multiple: float = 2.0
     trailing_stop_pct: float = 0.03
+    max_trailing_stop_pct: float = 0.06
+    trailing_volatility_multiple: float = 2.0
     breakeven_trigger_pct: float = 0.025
     breakeven_buffer_pct: float = 0.003
-    profit_lock_trigger_pct: float = 0.08
+    # 백테스트 스윕에서 KR은 이익잠금이 러너를 일찍 잘라 수익을 깎았다(+101%→+121%).
+    # 사실상 비활성(100%)으로 두고, US 프로필만 낮은 트리거로 활성화한다.
+    profit_lock_trigger_pct: float = 1.00
     profit_lock_trailing_stop_pct: float = 0.02
     daily_drop_exit_pct: float = 0.035
-    max_holding_days: int = 10
+    # 스윕에서 10→15일이 우세: 추세를 못 만든 포지션만 정리하되 너무 일찍 자르지 않는다
+    max_holding_days: int = 15
     # 비용 인지 게이트: 기대변동(일변동성×√보유일)이 왕복비용×배수 이상일 때만 진입
     min_edge_multiple: float = 3.0
     # 청산 후 같은 종목 재진입 금지 기간(수수료 회전 방지).
@@ -134,13 +143,16 @@ def default_market_profiles() -> dict[str, dict]:
                 "max_intraday_extension_pct": 0.06,
                 "volume_spike_multiplier": 1.8,
                 "stop_loss_pct": 0.06,
+                "max_stop_loss_pct": 0.10,
                 "trailing_stop_pct": 0.05,
+                "max_trailing_stop_pct": 0.08,
                 "breakeven_trigger_pct": 0.04,
                 "breakeven_buffer_pct": 0.004,
                 "profit_lock_trigger_pct": 0.12,
                 "profit_lock_trailing_stop_pct": 0.03,
                 "daily_drop_exit_pct": 0.045,
-                "max_holding_days": 25,
+                # 스윕에서 25→45일 연장이 회전 비용을 줄여 전·후반 모두 개선
+                "max_holding_days": 45,
                 "min_edge_multiple": 5.0,
                 "reentry_cooldown_days": 10,
                 "entry_cutoff_minutes": 30,

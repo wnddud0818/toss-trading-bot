@@ -30,6 +30,36 @@ class HybridMomentumStrategy:
         self.costs = costs or CostSettings.zero()
         self.market = market
 
+    def effective_stop_loss_pct(self, volatility: Decimal | None) -> Decimal:
+        """일변동성에 비례해 스탑을 넓힌다(floor=stop_loss_pct, cap=max_stop_loss_pct).
+        고정 스탑은 변동성 큰 종목에서 노이즈 손절을 반복해 비용으로 계좌를 깎는다."""
+        return self._volatility_scaled_pct(
+            volatility,
+            self.settings.stop_volatility_multiple,
+            self.settings.stop_loss_pct,
+            self.settings.max_stop_loss_pct,
+        )
+
+    def effective_trailing_stop_pct(self, volatility: Decimal | None) -> Decimal:
+        return self._volatility_scaled_pct(
+            volatility,
+            self.settings.trailing_volatility_multiple,
+            self.settings.trailing_stop_pct,
+            self.settings.max_trailing_stop_pct,
+        )
+
+    def _volatility_scaled_pct(
+        self,
+        volatility: Decimal | None,
+        multiple: float,
+        floor: float,
+        cap: float,
+    ) -> Decimal:
+        floor_pct = dec(floor)
+        if volatility is None or volatility <= 0:
+            return floor_pct
+        return min(max(dec(multiple) * volatility, floor_pct), dec(cap))
+
     @property
     def round_trip_cost(self) -> Decimal:
         """매수+매도 수수료, 매도 세금/수수료, 양방향 슬리피지를 합친 왕복 비용 비율."""
@@ -142,17 +172,18 @@ class HybridMomentumStrategy:
         intraday_candles: list[Candle],
         today: date,
         market_filter_ok: bool = True,
+        daily_volatility: Decimal | None = None,
     ) -> Signal | None:
         if not intraday_candles:
             return None
         session = _session_slice(sorted(intraday_candles, key=lambda candle: candle.timestamp))
         latest = session[-1]
         high_watermark = max(position.high_watermark, max(candle.high for candle in session))
-        fixed_stop = position.entry_price * (Decimal("1") - dec(self.settings.stop_loss_pct))
+        fixed_stop = position.entry_price * (Decimal("1") - self.effective_stop_loss_pct(daily_volatility))
         profit_from_entry = high_watermark / position.entry_price - Decimal("1")
         close_profit = latest.close / position.entry_price - Decimal("1")
         is_locked_winner = profit_from_entry >= dec(self.settings.profit_lock_trigger_pct)
-        trailing_pct = dec(self.settings.trailing_stop_pct)
+        trailing_pct = self.effective_trailing_stop_pct(daily_volatility)
         trailing_reason = "trailing stop"
         if is_locked_winner:
             trailing_pct = dec(self.settings.profit_lock_trailing_stop_pct)

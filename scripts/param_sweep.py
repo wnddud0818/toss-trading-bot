@@ -15,20 +15,19 @@ from toss_bot.config import load_settings
 from toss_bot.models import MarketCountry
 from toss_bot.utils import quiet_external_data_source
 
-START = date(2026, 1, 2)
-MID = date(2026, 3, 20)
+START = date(2025, 1, 2)
+MID = date(2025, 9, 15)
 END = date(2026, 6, 1)
 
 GRIDS = {
     "KR": {
-        "trailing_stop_pct": [0.03, 0.04, 0.05],
-        "profit_lock_trailing_stop_pct": [0.02, 0.03],
-        "reentry_cooldown_days": [1, 5, 10],
+        "profit_lock_trigger_pct": [1.0, 9.9],
+        "max_holding_days": [10, 15, 20],
     },
     "US": {
-        "trailing_stop_pct": [0.05, 0.07],
-        "profit_lock_trailing_stop_pct": [0.03, 0.04],
-        "reentry_cooldown_days": [5, 10],
+        "profit_lock_trigger_pct": [0.12, 0.20, 9.9],
+        "profit_lock_trailing_stop_pct": [0.03, 0.05],
+        "max_holding_days": [25, 45],
     },
 }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_DOWN
@@ -167,6 +168,12 @@ class Backtester:
 
         strategy = HybridMomentumStrategy(strategy_settings, costs)
         round_trip = strategy.round_trip_cost
+        # 변동성 적응 스탑과 비용 허들에 쓰는 20일 일변동성, 동일가중 레짐 지수(MA60)
+        volatility_frame = closes.pct_change().rolling(strategy_settings.volatility_window).std()
+        index_series = closes.mean(axis=1)
+        index_ma = index_series.rolling(60).mean()
+        edge_hurdle = round_trip * dec(strategy_settings.min_edge_multiple)
+        sqrt_holding = dec(math.sqrt(strategy_settings.max_holding_days))
         cash = initial
         holdings: dict[str, _SimPosition] = {}
         last_sell: dict[str, date] = {}
@@ -174,14 +181,21 @@ class Backtester:
         max_window = max(strategy_settings.momentum_windows)
         last_rebalance_week: tuple[int, int] | None = None
 
+        def symbol_volatility(timestamp: pd.Timestamp, symbol: str) -> Decimal | None:
+            value = volatility_frame.at[timestamp, symbol]
+            return None if pd.isna(value) else dec(value)
+
         for day in trading_days:
             timestamp = pd.Timestamp(day)
             row_close = closes.loc[timestamp]
             row_open = opens.loc[timestamp] if opens is not None else row_close
             row_high = highs.loc[timestamp] if highs is not None else row_close
             row_low = lows.loc[timestamp] if lows is not None else row_close
+            index_value = index_series.loc[timestamp]
+            index_mean = index_ma.loc[timestamp]
+            risk_on = pd.isna(index_mean) or index_value >= index_mean
 
-            # 실전 청산 엔진을 일봉 OHLC로 근사: 손절/트레일링/본전보호/시간청산
+            # 실전 청산 엔진을 일봉 OHLC로 근사: 손절/트레일링/본전보호/리스크오프/시간청산
             for symbol, position in list(holdings.items()):
                 if pd.isna(row_close[symbol]):
                     continue
@@ -189,16 +203,21 @@ class Backtester:
                 open_price = dec(row_open[symbol]) if not pd.isna(row_open[symbol]) else close_price
                 high_price = dec(row_high[symbol]) if not pd.isna(row_high[symbol]) else close_price
                 low_price = dec(row_low[symbol]) if not pd.isna(row_low[symbol]) else close_price
-                position.high_watermark = max(position.high_watermark, high_price)
-                profit_hwm = position.high_watermark / position.entry_price - Decimal("1")
+                # 당일 고가를 먼저 반영하면 "고가 후 저가" 최악 경로를 가정하게 되어
+                # 일중 변동이 트레일 폭을 넘는 날마다 무조건 청산된다.
+                # 표준 관행대로 스탑 판정은 전일까지의 고점 기준, 당일 고가는 판정 후 반영한다.
+                prior_high_watermark = position.high_watermark
+                profit_hwm = prior_high_watermark / position.entry_price - Decimal("1")
                 is_locked_winner = profit_hwm >= dec(strategy_settings.profit_lock_trigger_pct)
-                trail_pct = (
-                    dec(strategy_settings.profit_lock_trailing_stop_pct)
-                    if is_locked_winner
-                    else dec(strategy_settings.trailing_stop_pct)
-                )
-                stop = position.entry_price * (Decimal("1") - dec(strategy_settings.stop_loss_pct))
-                stop = max(stop, position.high_watermark * (Decimal("1") - trail_pct))
+                volatility = symbol_volatility(timestamp, symbol)
+                if is_locked_winner:
+                    trail_pct = dec(strategy_settings.profit_lock_trailing_stop_pct)
+                else:
+                    trail_pct = strategy.effective_trailing_stop_pct(volatility)
+                    if not risk_on:
+                        trail_pct = min(trail_pct, dec(strategy_settings.profit_lock_trailing_stop_pct))
+                stop = position.entry_price * (Decimal("1") - strategy.effective_stop_loss_pct(volatility))
+                stop = max(stop, prior_high_watermark * (Decimal("1") - trail_pct))
                 if profit_hwm >= dec(strategy_settings.breakeven_trigger_pct):
                     buffer = max(dec(strategy_settings.breakeven_buffer_pct), round_trip)
                     stop = max(stop, position.entry_price * (Decimal("1") + buffer))
@@ -207,6 +226,8 @@ class Backtester:
                     exit_price = open_price  # 갭하락은 스탑가가 아니라 시가 체결로 근사
                 elif low_price <= stop:
                     exit_price = stop
+                elif not risk_on and close_price < position.entry_price * (Decimal("1") + round_trip):
+                    exit_price = close_price  # 리스크오프: 미수익 포지션만 정리
                 elif (
                     (day - position.entry_date).days >= strategy_settings.max_holding_days
                     and not is_locked_winner
@@ -217,6 +238,8 @@ class Backtester:
                     del holdings[symbol]
                     last_sell[symbol] = day
                     trades += 1
+                else:
+                    position.high_watermark = max(prior_high_watermark, high_price)
 
             # 룩백 데이터는 시작일 이전 260일치를 이미 로드했으므로 워밍업 스킵 없이
             # 첫 거래일과 매주 첫 거래일(월요일 휴장 포함)에 신규 진입을 평가한다.
@@ -225,17 +248,18 @@ class Backtester:
             if week == last_rebalance_week:
                 continue
             last_rebalance_week = week
+            if not risk_on:
+                continue  # 레짐 필터: 지수가 MA60 아래면 신규 진입 금지 (실전 MarketFilter와 동일 방향)
             prices = closes.loc[:timestamp].tail(max_window + 1)
             ranked = self._rank_from_close_frame(prices, strategy_settings)
             if not ranked:
                 continue
             quantities = {symbol: position.quantity for symbol, position in holdings.items()}
             equity = self._equity(cash, quantities, row_close)
-            target_weight = min(
+            base_weight = min(
                 dec(self.settings.risk.max_symbol_weight),
                 (Decimal("1") - dec(self.settings.risk.min_cash_weight)) / Decimal(strategy_settings.max_positions),
             )
-            target_value = equity * target_weight
             reserve = equity * dec(self.settings.risk.min_cash_weight)
             for symbol in ranked:
                 if len(holdings) >= strategy_settings.max_positions:
@@ -248,6 +272,14 @@ class Backtester:
                 price = dec(row_close[symbol])
                 if price <= 0:
                     continue
+                volatility = symbol_volatility(timestamp, symbol)
+                # 실전과 동일한 비용 허들: 기대변동이 왕복비용×배수에 못 미치면 진입하지 않는다
+                if volatility is None or volatility * sqrt_holding < edge_hurdle:
+                    continue
+                # 스탑이 넓어진 만큼 비중을 줄여 1회 손실을 max_entry_risk_pct로 고정한다
+                effective_stop = strategy.effective_stop_loss_pct(volatility)
+                weight = min(base_weight, dec(self.settings.risk.max_entry_risk_pct) / effective_stop)
+                target_value = equity * weight
                 quantity = (target_value / price).to_integral_value(rounding=ROUND_DOWN)
                 total_cost = self._buy_cost(quantity, price, costs)
                 if quantity > 0 and total_cost <= cash - reserve:
@@ -270,7 +302,8 @@ class Backtester:
             currency=currency,
             warning=(
                 "Proxy backtest: entries are weekly at close (no intraday breakout/orderbook); "
-                "stops and time exits are approximated on daily OHLC."
+                "stops/time exits approximated on daily OHLC; regime filter uses equal-weight "
+                "universe index vs MA60."
             ),
         )
 

@@ -40,14 +40,19 @@ markets:
       momentum_weights: [0.50, 0.30, 0.20]
       volatility_window: 20
       min_score: 0.5
+      # 실제 스탑 폭 = clamp(일변동성 × multiple, 기본값, max값): 노이즈 손절 churn 방지
       stop_loss_pct: 0.04
+      max_stop_loss_pct: 0.08
+      stop_volatility_multiple: 2.0
       trailing_stop_pct: 0.03
+      max_trailing_stop_pct: 0.06
+      trailing_volatility_multiple: 2.0
       breakeven_trigger_pct: 0.025
       breakeven_buffer_pct: 0.003
-      profit_lock_trigger_pct: 0.08
+      profit_lock_trigger_pct: 1.00
       profit_lock_trailing_stop_pct: 0.02
       daily_drop_exit_pct: 0.035
-      max_holding_days: 10
+      max_holding_days: 15
       min_edge_multiple: 3.0
       reentry_cooldown_days: 5
       entry_cutoff_minutes: 10
@@ -88,13 +93,17 @@ markets:
       max_intraday_extension_pct: 0.06
       volume_spike_multiplier: 1.8
       stop_loss_pct: 0.06
+      max_stop_loss_pct: 0.10
+      stop_volatility_multiple: 2.0
       trailing_stop_pct: 0.05
+      max_trailing_stop_pct: 0.08
+      trailing_volatility_multiple: 2.0
       breakeven_trigger_pct: 0.04
       breakeven_buffer_pct: 0.004
       profit_lock_trigger_pct: 0.12
       profit_lock_trailing_stop_pct: 0.03
       daily_drop_exit_pct: 0.045
-      max_holding_days: 25
+      max_holding_days: 45
       min_edge_multiple: 5.0
       reentry_cooldown_days: 10
       entry_cutoff_minutes: 30
