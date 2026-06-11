@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from .config import Settings
-from .models import MarketCountry
+from .models import MarketCountry, RunMode
 from .runner import TradingBot
 
 # 정규장 커버 범위(KST). 실제 주문 가능 여부는 루프가 장 캘린더로 다시 확인하므로
@@ -57,15 +57,16 @@ def start_scheduler(settings: Settings, bot: TradingBot) -> None:
             second=5,
             start_date=started_at,
         )
-        scheduler.add_job(
-            bot.reconcile_open_orders,
-            "cron",
-            day_of_week="mon-fri",
-            hour=KR_LOOP_HOURS,
-            minute=f"*/{settings.schedule.reconcile_interval_minutes}",
-            second=20,
-            start_date=started_at,
-        )
+        if settings.mode == RunMode.LIVE:
+            scheduler.add_job(
+                bot.reconcile_open_orders,
+                "cron",
+                day_of_week="mon-fri",
+                hour=KR_LOOP_HOURS,
+                minute=f"*/{settings.schedule.reconcile_interval_minutes}",
+                second=20,
+                start_date=started_at,
+            )
 
     if MarketCountry.US in enabled:
         scheduler.add_job(
@@ -87,15 +88,16 @@ def start_scheduler(settings: Settings, bot: TradingBot) -> None:
             second=5,
             start_date=started_at,
         )
-        scheduler.add_job(
-            bot.reconcile_open_orders,
-            "cron",
-            day_of_week="mon-sat",
-            hour=US_LOOP_HOURS,
-            minute=f"*/{settings.schedule.reconcile_interval_minutes}",
-            second=20,
-            start_date=started_at,
-        )
+        if settings.mode == RunMode.LIVE:
+            scheduler.add_job(
+                bot.reconcile_open_orders,
+                "cron",
+                day_of_week="mon-sat",
+                hour=US_LOOP_HOURS,
+                minute=f"*/{settings.schedule.reconcile_interval_minutes}",
+                second=20,
+                start_date=started_at,
+            )
 
     report_days = "mon-sat" if MarketCountry.US in enabled else "mon-fri"
     scheduler.add_job(

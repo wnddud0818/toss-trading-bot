@@ -52,16 +52,16 @@ class UniverseBuilder:
     def _load_from_krx(self, as_of: date) -> list[UniverseCandidate]:
         try:
             return self._load_from_pykrx(as_of)
-        except Exception:
-            logger.exception("pykrx universe source failed; trying FinanceDataReader")
+        except Exception as exc:
+            logger.debug("pykrx universe source unavailable; trying FinanceDataReader: %s", exc)
             return self._load_from_finance_datareader()
 
     def _load_from_pykrx(self, as_of: date) -> list[UniverseCandidate]:
-        from pykrx import stock
-
         date_text = as_of.strftime("%Y%m%d")
         rows: list[UniverseCandidate] = []
         with quiet_external_data_source():
+            from pykrx import stock
+
             for market in self.settings.segments:
                 tickers = stock.get_market_ticker_list(date_text, market=market)
                 ohlcv = stock.get_market_ohlcv(date_text, market=market)
@@ -210,20 +210,21 @@ class UniverseBuilder:
         return unique[: self.settings.pool_cap]
 
     def _verify_us_with_toss(self, pool: list[str]) -> dict[str, dict]:
-        allowed_types = {"FOREIGN_STOCK"}
+        allowed_types = {"FOREIGN_STOCK", "STOCK"}
         if self.settings.include_etf:
-            allowed_types.add("FOREIGN_ETF")
+            allowed_types.update({"FOREIGN_ETF", "ETF"})
         verified: dict[str, dict] = {}
         for batch in _chunks(pool, 200):
             for stock_info in extract_items(self.toss_client.get_stocks(batch), "stocks", "items"):
                 symbol = stock_info.get("symbol")
+                security_type = stock_info.get("securityType")
                 if symbol not in pool or stock_info.get("status") != "ACTIVE":
                     continue
                 if stock_info.get("currency") != "USD":
                     continue
-                if stock_info.get("securityType") not in allowed_types:
+                if security_type not in allowed_types:
                     continue
-                if stock_info.get("securityType") == "FOREIGN_STOCK" and not stock_info.get("isCommonShare", True):
+                if security_type in {"FOREIGN_STOCK", "STOCK"} and not stock_info.get("isCommonShare", True):
                     continue
                 verified[symbol] = stock_info
         return verified

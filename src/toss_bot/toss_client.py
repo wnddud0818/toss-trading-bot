@@ -224,7 +224,11 @@ class TossClient:
         try:
             payload = response.json()
         except ValueError:
-            raise TossApiError(response.status_code, None, response.text)
+            body = response.text.strip().replace("\r", " ").replace("\n", " ")
+            if len(body) > 500:
+                body = body[:500] + "...(truncated)"
+            content_type = response.headers.get("content-type", "unknown")
+            raise TossApiError(response.status_code, None, f"non-JSON response content-type={content_type}: {body}")
         if "error" in payload and isinstance(payload["error"], str):
             raise TossApiError(response.status_code, payload.get("error"), payload.get("error_description", ""))
         error = payload.get("error") or payload.get("result") or payload

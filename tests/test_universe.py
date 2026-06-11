@@ -56,7 +56,7 @@ class UsTossStub:
                     "symbol": "AAPL",
                     "status": "ACTIVE",
                     "currency": "USD",
-                    "securityType": "FOREIGN_STOCK",
+                    "securityType": "STOCK",
                     "isCommonShare": True,
                     "market": "NASDAQ",
                     "englishName": "Apple",

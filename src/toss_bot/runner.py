@@ -153,6 +153,9 @@ class TradingBot:
         self._process_entries(market)
 
     def reconcile_open_orders(self, *, cancel_stale: bool | None = None) -> ReconcileReport:
+        if self.settings.mode == RunMode.PAPER:
+            logger.info("Order reconcile skipped in paper mode")
+            return ReconcileReport(open_orders=0, canceled_orders=0, kept_orders=0)
         report = self.order_reconciler.reconcile(cancel_stale=cancel_stale)
         self.notifier.send(f"[toss-bot] order reconcile {report.summary()}")
         if report.errors:

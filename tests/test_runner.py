@@ -144,6 +144,20 @@ def test_market_filter_unavailable_does_not_force_risk_off_exits(tmp_path, monke
     assert seen == [True]
 
 
+def test_paper_reconcile_skips_live_open_order_lookup(tmp_path):
+    class FailingOrderLookupStub(TossRunnerStub):
+        def get_open_orders(self):
+            raise AssertionError("paper mode should not query live open orders")
+
+    bot, _ = make_bot(tmp_path, FailingOrderLookupStub())
+
+    report = bot.reconcile_open_orders()
+
+    assert report.open_orders == 0
+    assert report.canceled_orders == 0
+    assert report.kept_orders == 0
+
+
 def test_exit_failure_does_not_block_other_positions(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "now_kst", lambda: datetime(2026, 6, 10, 10, 0, tzinfo=KST))
     bot, repository = make_bot(tmp_path, TossMarketDataStub())
